@@ -2,16 +2,18 @@
 sonny.py — Punto de entrada principal de Sonny.
 """
 import os
-from core.ai       import interpret, test_providers, active_provider
-from core.launcher import launch
+from core.ai          import interpret, test_providers, active_provider
+from core.agent       import run_agent, es_tarea_agente
+from core.orchestrator import run_orchestrator_with_site, detectar_navegadores
+from core.launcher    import launch
 from core.registry import get_all, item_type
-from config        import PROVIDERS
+from config      import PROVIDERS
 
 # ── Colores ────────────────────────────────────────────────────────────────────
 class C:
     CYAN   = "\033[96m";  GREEN  = "\033[92m";  YELLOW = "\033[93m"
     RED    = "\033[91m";  BOLD   = "\033[1m";   DIM    = "\033[2m"
-    RESET  = "\033[0m"
+    RESET  = "\033[0m";   MAGENTA= "\033[95m"
 
 # ── Palabras afirmativas / negativas ───────────────────────────────────────────
 _SI = {"s","si","sí","yes","y","ok","dale","claro","correcto","exacto",
@@ -58,11 +60,28 @@ def cmd_ayuda():
   {C.CYAN}ayuda{C.RESET}    → mostrar esta ayuda
   {C.CYAN}salir{C.RESET}    → cerrar Sonny
 
-{C.BOLD}  Ejemplos de uso:{C.RESET}
+{C.BOLD}  Modo Launcher:{C.RESET}
   {C.DIM}"abre chrome"           → abre Google Chrome
   "quiero grabar pantalla"  → abre OBS
-  "lanza steam por favor"   → abre Steam
-  "abre ods"                → sugiere obs{C.RESET}
+  "lanza steam"             → abre Steam{C.RESET}
+
+{C.BOLD}  Modo Agente 🤖 (API keys — rápido):{C.RESET}
+  {C.DIM}"desarrolla una app que sume números"
+  "crea un script que descargue imágenes"
+  "haz una página web con un formulario de contacto"{C.RESET}
+
+{C.BOLD}  Modo Orquestador 🌐 (IAs web — más potente):{C.RESET}
+  {C.DIM}"usando web, haz un hola mundo en Angular"
+  "pregunta a chatgpt cómo hacer un login en React"
+  "usa claude para crear una API REST en Flask"
+  "consulta a gemini cómo optimizar esta consulta SQL"{C.RESET}
+
+{C.BOLD}  El orquestador puede:{C.RESET}
+  {C.DIM}✅ Abrir Chrome/Edge y navegar a Claude.ai, ChatGPT, Gemini, Qwen
+  ✅ Escribir el prompt y leer la respuesta automáticamente
+  ✅ Ejecutar los pasos que dé la IA (npm, ng, pip, etc.)
+  ✅ Detectar errores y pedirle a la IA que los corrija
+  ✅ Guardar la sesión (no re-loguearse cada vez){C.RESET}
     """)
 
 # ── Banner ─────────────────────────────────────────────────────────────────────
@@ -75,12 +94,14 @@ def banner():
         ai_st = f"{C.YELLOW}sin proveedores — modo fuzzy activo{C.RESET}"
     print(f"""
 {C.CYAN}{C.BOLD}  ╔══════════════════════════════════╗
-  ║         SONNY  v3.1            ║
+  ║         SONNY  v4.0            ║
   ╚══════════════════════════════════╝{C.RESET}
-  {C.DIM}IA     : {ai_st}
-  Items  : {len(get_all())} cargados{C.RESET}
-  {C.YELLOW}Habla con Sonny en tus propias palabras.{C.RESET}
-  {C.DIM}Escribe 'ayuda' para ver comandos especiales.{C.RESET}
+  {C.DIM}IA      : {ai_st}
+  Items   : {len(get_all())} cargados
+  Agente  : {C.GREEN if keys_ok else C.YELLOW}{'✅ disponible' if keys_ok else '⚠️  requiere IA'}{C.DIM}{C.RESET}
+  Orquestador: {C.GREEN}✅ modo web activo{C.RESET}
+  {C.YELLOW}Habla con Sonny — abre apps, programa o di "usando web haz..."{C.RESET}
+  {C.DIM}Escribe 'ayuda' para ver todos los comandos.{C.RESET}
     """)
 
 # ── Loop principal ─────────────────────────────────────────────────────────────
@@ -90,7 +111,7 @@ CMDS_SALIR = {"salir", "exit", "quit", "chau", "bye"}
 def main():
     banner()
 
-    pendiente  : str | None = None   # nombre de app esperando confirmación
+    pendiente  : str | None = None
     modo_fuzzy : bool = not any(
         p.get("api_key") and "XXXX" not in p["api_key"] for p in PROVIDERS
     )
@@ -133,7 +154,33 @@ def main():
                 pendiente = None
                 continue
 
-            # ── Interpretar ────────────────────────────────────────────────
+            # ── Detectar frameworks que REQUIEREN el orquestador ─────────────
+            # El agente no puede manejar Angular/React/Vue/etc — necesitan CLI
+            FRAMEWORKS = [
+                "angular", "react", "vue", "next.js", "nextjs", "nuxt",
+                "svelte", "flutter", "django", "rails", "laravel",
+                "spring boot", "springboot", "express", "fastapi",
+            ]
+            TRIGGERS_WEB = [
+                "usando web", "busca en ia", "pregunta a ", "consulta a ",
+                "usa claude", "usa chatgpt", "usa gemini", "usa qwen",
+                "navega y", "web haz", "pide a la ia",
+            ]
+            needs_framework = any(f in low for f in FRAMEWORKS)
+            is_web_task     = any(t in low for t in TRIGGERS_WEB)
+
+            if (is_web_task or needs_framework) and not modo_fuzzy:
+                if needs_framework and not is_web_task:
+                    print(f"  {C.DIM}Framework detectado — usando orquestador web{C.RESET}")
+                run_orchestrator_with_site(user_input)
+                continue
+
+            # ── Modo Agente (solo para tareas sin framework) ───────────────
+            if es_tarea_agente(user_input) and not modo_fuzzy:
+                run_agent(user_input)
+                continue
+
+            # ── Modo Launcher (interpreta con IA o fuzzy) ──────────────────
             if not modo_fuzzy:
                 prv = active_provider or "IA"
                 print(f"{C.DIM}  [interpretando con {prv}...]{C.RESET}", end="\r")
@@ -141,7 +188,6 @@ def main():
             accion, used_ai = interpret(user_input, force_fuzzy=modo_fuzzy)
             print(" " * 45, end="\r")
 
-            # Si la IA falló y se usó fuzzy, activar modo fuzzy permanente
             if not used_ai and not modo_fuzzy:
                 modo_fuzzy = True
                 print(f"{C.YELLOW}⚠️  IA no disponible → modo sin modelo activado.")
@@ -161,7 +207,14 @@ def main():
                 pendiente = item
 
             elif action in ("not_found", "unknown", "help", "error"):
-                print(f"{C.YELLOW}🤖 {accion.get('msg', '')}{C.RESET}")
+                # Segunda oportunidad: ¿es una tarea de agente disfrazada?
+                if not modo_fuzzy and any(t in low for t in ["crea","haz","escribe","genera","construye"]):
+                    print(f"{C.YELLOW}🤖 No encontré esa app. ¿Quieres que lo programe? {C.DIM}(s/n){C.RESET}")
+                    resp = input(f"{C.CYAN}tú > {C.RESET}").strip()
+                    if es_si(resp.lower()):
+                        run_agent(user_input)
+                else:
+                    print(f"{C.YELLOW}🤖 {accion.get('msg', '')}{C.RESET}")
 
         except KeyboardInterrupt:
             print(f"\n{C.CYAN}👋 Hasta luego.{C.RESET}")

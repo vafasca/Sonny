@@ -37,3 +37,6 @@ dist/
 # ── Windows ───────────────────────────────────────────────────────
 Thumbs.db
 desktop.ini
+
+# files
+workspace/
