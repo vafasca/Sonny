@@ -4,12 +4,23 @@ core/ai_scraper.py
 Abre el navegador, envía prompts en secuencia y devuelve respuestas.
 v2: parse_steps soporta respuestas JSON además del formato texto original.
 """
-import asyncio, re, json
+import atexit
+import asyncio
+import json
+import re
+import threading
+
 from core.browser import BrowserSession, AI_SITES, check_playwright, install_playwright, C
 from core.web_log  import log_prompt, log_response, log_error
 
 SITE_PRIORITY = ["claude", "chatgpt", "gemini", "qwen"]
 _PERSISTENT_SESSIONS: dict[str, BrowserSession] = {}
+
+# Runtime async persistente en hilo aparte para no romper objetos Playwright
+# entre múltiples llamadas síncronas a ask_ai_multiturn().
+_RUNTIME_LOOP: asyncio.AbstractEventLoop | None = None
+_RUNTIME_THREAD: threading.Thread | None = None
+_RUNTIME_LOCK = threading.Lock()
 
 
 def parse_steps(response: str) -> list[dict]:
@@ -62,7 +73,6 @@ def _parse_steps_json(response: str) -> list[dict] | None:
 
     result = []
     SKIP_CMDS = ("ng serve", "npm start", "npm run dev", "cd ", "node -v", "npm -v")
-    ALLOWED_START = ("npm ", "npx ", "ng ", "pip ", "python ", "node ", "mkdir ", "git ")
 
     for s in steps_raw:
         if not isinstance(s, dict):
@@ -76,12 +86,6 @@ def _parse_steps_json(response: str) -> list[dict] | None:
         if cmd and any(cmd.lower().startswith(sk) for sk in SKIP_CMDS):
             cmd = None
 
-        step = {
-            "type": "json_step",
-            "description": s.get("description", s.get("desc", "")),
-            "cmd": cmd,
-            "files": s.get("files", []),
-        }
         # Convertir a formato "cmd" simple para compatibilidad
         if cmd:
             result.append({"type": "cmd", "value": cmd})
@@ -102,6 +106,67 @@ def _parse_steps_text(response: str) -> list[dict]:
             seen.add(line)
             steps.append({"type":"cmd","value":line})
     return steps
+
+
+def _runtime_loop_worker(loop: asyncio.AbstractEventLoop):
+    asyncio.set_event_loop(loop)
+    loop.run_forever()
+
+
+def _ensure_runtime_loop() -> asyncio.AbstractEventLoop:
+    global _RUNTIME_LOOP, _RUNTIME_THREAD
+    with _RUNTIME_LOCK:
+        if _RUNTIME_LOOP and _RUNTIME_THREAD and _RUNTIME_THREAD.is_alive():
+            return _RUNTIME_LOOP
+
+        loop = asyncio.new_event_loop()
+        thread = threading.Thread(
+            target=_runtime_loop_worker,
+            args=(loop,),
+            name="sonny-ai-scraper-loop",
+            daemon=True,
+        )
+        thread.start()
+        _RUNTIME_LOOP = loop
+        _RUNTIME_THREAD = thread
+        return loop
+
+
+async def _close_all_sessions_async():
+    for key, session in list(_PERSISTENT_SESSIONS.items()):
+        try:
+            await session.close()
+        except Exception as e:
+            log_error(AI_SITES.get(key, {}).get("name", key), f"close_session: {e}")
+    _PERSISTENT_SESSIONS.clear()
+
+
+def _shutdown_runtime_loop():
+    global _RUNTIME_LOOP, _RUNTIME_THREAD
+    with _RUNTIME_LOCK:
+        loop = _RUNTIME_LOOP
+        thread = _RUNTIME_THREAD
+        _RUNTIME_LOOP = None
+        _RUNTIME_THREAD = None
+
+    if not loop or not thread:
+        return
+
+    try:
+        future = asyncio.run_coroutine_threadsafe(_close_all_sessions_async(), loop)
+        future.result(timeout=5)
+    except Exception:
+        pass
+
+    try:
+        loop.call_soon_threadsafe(loop.stop)
+    except Exception:
+        pass
+
+    thread.join(timeout=2)
+
+
+atexit.register(_shutdown_runtime_loop)
 
 
 async def _run_multiturn(prompts: list[str], site_key: str, objetivo: str) -> list[str]:
@@ -184,12 +249,17 @@ async def _multiturn_async(prompts: list[str], preferred_site: str = None,
 
 def ask_ai_multiturn(prompts: list[str], preferred_site: str = None,
                      objetivo: str = "") -> tuple[str, list[str]]:
-    return asyncio.run(_multiturn_async(prompts, preferred_site, objetivo))
+    loop = _ensure_runtime_loop()
+    future = asyncio.run_coroutine_threadsafe(
+        _multiturn_async(prompts, preferred_site, objetivo), loop
+    )
+    return future.result()
 
 
 # Compatibilidad
 def ask_ai_web_multiturn(prompts, preferred_site=None, objetivo=""):
     return ask_ai_multiturn(prompts, preferred_site, objetivo)
+
 
 def ask_ai_web_sync(objetivo, preferred_site=None, raw_prompt=None):
     prompt = raw_prompt if raw_prompt else objetivo
