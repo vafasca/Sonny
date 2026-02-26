@@ -289,18 +289,24 @@ class BrowserSession:
             print(f"  {C.YELLOW}⚠️ Login automático no completado: {e}{C.RESET}")
             return False
 
-    async def needs_login(self) -> bool:
-        """Detecta si la página pide login."""
-        try:
-            await self._page.goto(self.site["url"], wait_until="domcontentloaded", timeout=30000)
-            await asyncio.sleep(2)
-        except Exception:
-            # Si hay navegación concurrente (OAuth en curso), tratar como login pendiente.
-            url_now = (self._page.url or "").lower()
-            if "accounts.google.com" in url_now or "auth.openai.com" in url_now:
-                return True
+    async def needs_login(self, navigate_if_needed: bool = True) -> bool:
+        """Detecta si la página pide login sin romper el hilo actual del chat."""
+        page = self._page
+        current_url = (page.url or "").lower()
+        site_host = re.sub(r"^https?://", "", self.site["url"]).split("/")[0].lower()
 
-        url = (self._page.url or "").lower()
+        should_navigate = navigate_if_needed and (not current_url or site_host not in current_url)
+        if should_navigate:
+            try:
+                await page.goto(self.site["url"], wait_until="domcontentloaded", timeout=30000)
+                await asyncio.sleep(2)
+            except Exception:
+                # Si hay navegación concurrente (OAuth en curso), tratar como login pendiente.
+                url_now = (page.url or "").lower()
+                if "accounts.google.com" in url_now or "auth.openai.com" in url_now:
+                    return True
+
+        url = (page.url or "").lower()
         login_signals = ["login", "signin", "sign-in", "auth", "account/login", "welcome"]
 
         # ChatGPT: si aparece botón de login, consideramos sesión NO autenticada
@@ -378,7 +384,7 @@ class BrowserSession:
             await page.wait_for_selector(site["input_sel"], timeout=15000)
         except Exception as e:
             # Si la sesión expiró entre turnos, reintentar tras login.
-            if await self.needs_login():
+            if await self.needs_login(navigate_if_needed=False):
                 await self.wait_for_login()
                 await page.goto(site["url"], wait_until="domcontentloaded", timeout=30000)
                 await asyncio.sleep(2)

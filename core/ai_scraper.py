@@ -194,13 +194,6 @@ async def _run_multiturn(prompts: list[str], site_key: str, objetivo: str) -> li
         _PERSISTENT_SESSIONS[site_key] = session
         await session.start()
 
-    if await session.needs_login():
-        await session.wait_for_login()
-        await session._page.goto(
-            AI_SITES[site_key]["url"],
-            wait_until="domcontentloaded", timeout=30000
-        )
-
     for idx, prompt in enumerate(prompts, 1):
         print(f"  [Turno {idx}/{len(prompts)}] Enviando...", flush=True)
         log_prompt(site_name, objetivo, prompt)
