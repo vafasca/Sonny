@@ -17,9 +17,9 @@ class C:
 SESSIONS_DIR = Path(__file__).parent.parent / "sessions"
 SESSIONS_DIR.mkdir(exist_ok=True)
 
-# Perfil persistente de Edge para automatización (aislado de tu Edge personal)
-EDGE_PROFILE_DIR = Path(__file__).parent.parent / "perfil_edge"
-EDGE_PROFILE_DIR.mkdir(exist_ok=True)
+# Perfiles persistentes de Edge por IA (aislados del Edge personal)
+EDGE_PROFILES_DIR = Path(__file__).parent.parent / "perfil_edge"
+EDGE_PROFILES_DIR.mkdir(exist_ok=True)
 
 # Opción avanzada: conectarse a tu Chrome REAL vía CDP (tu propio perfil/sesión)
 USE_SYSTEM_CHROME = (os.environ.get("SONNY_USE_SYSTEM_CHROME") or "").strip().lower() in {"1","true","yes","si","sí"}
@@ -97,6 +97,8 @@ class BrowserSession:
         self._pw          = None
         self._started     = False
         self._using_system_chrome = False
+        self._profile_dir = EDGE_PROFILES_DIR / self.site_key
+        self._profile_dir.mkdir(parents=True, exist_ok=True)
 
     async def _start_with_system_chrome(self) -> bool:
         """Conecta Playwright a una instancia real de Chrome abierta con --remote-debugging-port."""
@@ -114,7 +116,7 @@ class BrowserSession:
             return True
         except Exception as e:
             print(f"  {C.YELLOW}⚠️ No pude conectar a Chrome real ({CHROME_CDP_URL}): {e}{C.RESET}")
-            print(f"  {C.DIM}   Fallback automático a Edge persistente (perfil_edge).{C.RESET}")
+            print(f"  {C.DIM}   Fallback automático a Edge persistente por IA.{C.RESET}")
             return False
 
     async def start(self):
@@ -129,7 +131,7 @@ class BrowserSession:
         connected_real = await self._start_with_system_chrome()
         if not connected_real:
             self._context = await self._pw.chromium.launch_persistent_context(
-                user_data_dir=str(EDGE_PROFILE_DIR),
+                user_data_dir=str(self._profile_dir),
                 channel="msedge",
                 headless=False,
                 ignore_default_args=["--enable-automation"],
@@ -333,7 +335,7 @@ class BrowserSession:
     async def wait_for_login(self):
         """Intenta login automático (si hay credenciales) o espera login manual."""
         if self._chatgpt_allow_automated_login() and await self._try_chatgpt_env_login():
-            print(f"  {C.GREEN}✅ Sesión persistida en {EDGE_PROFILE_DIR}{C.RESET}\n")
+            print(f"  {C.GREEN}✅ Sesión persistida en {self._profile_dir}{C.RESET}\n")
             return
 
         print(f"\n  {C.YELLOW}{'─'*50}{C.RESET}")
@@ -347,7 +349,7 @@ class BrowserSession:
 
         # Esperar estabilización del flujo OAuth para evitar 'navigation interrupted'.
         await self._wait_until_chatgpt_ready_after_login()
-        print(f"  {C.GREEN}✅ Sesión persistida en {EDGE_PROFILE_DIR}{C.RESET}\n")
+        print(f"  {C.GREEN}✅ Sesión persistida en {self._profile_dir}{C.RESET}\n")
 
     # ──────────────────────────────────────────────────────────────────────────
     #   ENVIAR PROMPT — usa portapapeles para soportar texto de cualquier largo

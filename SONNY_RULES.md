@@ -149,9 +149,9 @@ Dame los pasos corregidos para solucionar este error.
 
 ## Login persistente en ChatGPT
 
-- Sonny guarda cookies/sesión en `perfil_edge` usando Microsoft Edge (channel `msedge`).
+- Sonny guarda cookies/sesión en `perfil_edge/<ia>` (ej: `perfil_edge/claude`, `perfil_edge/chatgpt`) usando Microsoft Edge (`msedge`).
 - Si inicias sesión una vez (manual o automático), debería persistir al cerrar/abrir Sonny.
-- Recomendado: haz login manual una sola vez en esa ventana Edge; la sesión quedará en `perfil_edge`.
+- Recomendado: haz login manual una sola vez por IA en Edge; la sesión quedará en su subcarpeta de `perfil_edge`.
 - Google puede bloquear logins automatizados cuando detecta navegador controlado por tests.
 - Login automático queda como opción avanzada, habilitándolo explícitamente:
 
