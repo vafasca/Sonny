@@ -141,18 +141,92 @@ class BrowserSession:
     async def __aexit__(self, *args):
         await self.close()
 
+    async def _chatgpt_has_login_button(self) -> bool:
+        """Detecta botón de login visible en ChatGPT (incluye interfaz en español)."""
+        if self.site_key != "chatgpt":
+            return False
+
+        page = self._page
+        selectors = [
+            'button:has-text("Iniciar sesión")',
+            'a:has-text("Iniciar sesión")',
+            'button:has-text("Log in")',
+            'a:has-text("Log in")',
+        ]
+        for sel in selectors:
+            try:
+                if await page.query_selector(sel):
+                    return True
+            except Exception:
+                pass
+        return False
+
+    async def _try_chatgpt_env_login(self) -> bool:
+        """Intenta login automático en ChatGPT con variables de entorno."""
+        if self.site_key != "chatgpt":
+            return False
+
+        email = (os.environ.get("CHATGPT_EMAIL") or "").strip()
+        password = (os.environ.get("CHATGPT_PASSWORD") or "").strip()
+        if not email or not password:
+            return False
+
+        page = self._page
+        try:
+            print(f"  {C.DIM}Intentando login automático con CHATGPT_EMAIL...{C.RESET}")
+            await page.goto("https://chatgpt.com/auth/login", wait_until="domcontentloaded", timeout=30000)
+
+            await page.wait_for_selector('input[type="email"]', timeout=15000)
+            await page.fill('input[type="email"]', email)
+            await page.keyboard.press("Enter")
+
+            await page.wait_for_selector('input[type="password"]', timeout=15000)
+            await page.fill('input[type="password"]', password)
+            await page.keyboard.press("Enter")
+            await asyncio.sleep(4)
+
+            await page.goto(self.site["url"], wait_until="domcontentloaded", timeout=30000)
+            await page.wait_for_selector(self.site["input_sel"], timeout=15000)
+            print(f"  {C.GREEN}✅ Login automático en ChatGPT exitoso.{C.RESET}")
+            return True
+        except Exception as e:
+            print(f"  {C.YELLOW}⚠️ Login automático no completado: {e}{C.RESET}")
+            return False
+
     async def needs_login(self) -> bool:
         """Detecta si la página pide login."""
         await self._page.goto(self.site["url"], wait_until="domcontentloaded", timeout=30000)
         await asyncio.sleep(2)
-        url = self._page.url.lower()
+        url = (self._page.url or "").lower()
         login_signals = ["login", "signin", "sign-in", "auth", "account/login", "welcome"]
-        return any(s in url for s in login_signals)
+
+        # Si aparece el input de chat, no requiere login.
+        try:
+            if await self._page.query_selector(self.site["input_sel"]):
+                return False
+        except Exception:
+            pass
+
+        if any(s in url for s in login_signals):
+            return True
+
+        # ChatGPT sin sesión puede quedarse en home con botón "Iniciar sesión".
+        if self.site_key == "chatgpt" and await self._chatgpt_has_login_button():
+            return True
+
+        return False
 
     async def wait_for_login(self):
-        """Espera a que el usuario se loguee manualmente."""
+        """Intenta login automático (si hay credenciales) o espera login manual."""
+        if await self._try_chatgpt_env_login():
+            await self._context.storage_state(path=str(self.session_path))
+            print(f"  {C.GREEN}✅ Sesión guardada en {self.session_path}{C.RESET}\n")
+            return
+
         print(f"\n  {C.YELLOW}{'─'*50}{C.RESET}")
         print(f"  {C.YELLOW}🔐 Necesitas loguearte en {self.site['name']}{C.RESET}")
+        if self.site_key == "chatgpt":
+            print(f"  {C.DIM}Opcional login automático: set CHATGPT_EMAIL y CHATGPT_PASSWORD.{C.RESET}")
         print(f"  {C.DIM}El navegador está abierto. Loguéate y luego vuelve aquí.{C.RESET}")
         print(f"  {C.CYAN}Presiona ENTER cuando hayas iniciado sesión...{C.RESET}")
         input()
@@ -182,8 +256,15 @@ class BrowserSession:
         try:
             await page.wait_for_selector(site["input_sel"], timeout=15000)
         except Exception as e:
-            print(f"  {C.RED}Error encontrando input: {e}{C.RESET}")
-            raise
+            # Si la sesión expiró entre turnos, reintentar tras login.
+            if await self.needs_login():
+                await self.wait_for_login()
+                await page.goto(site["url"], wait_until="domcontentloaded", timeout=30000)
+                await asyncio.sleep(2)
+                await page.wait_for_selector(site["input_sel"], timeout=15000)
+            else:
+                print(f"  {C.RED}Error encontrando input: {e}{C.RESET}")
+                raise
 
         # ── Copiar al portapapeles del sistema con pyperclip ──────────────────
         try:

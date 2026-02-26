@@ -146,6 +146,30 @@ Dame los pasos corregidos para solucionar este error.
 
 ---
 
+
+## Login persistente en ChatGPT
+
+- Sonny guarda cookies/sesión en `sessions/chatgpt_session`.
+- Si inicias sesión una vez (manual o automático), debería persistir al cerrar/abrir Sonny.
+- Para login automático opcional (sin escribir usuario/clave en cada corrida), define estas variables de entorno antes de ejecutar Sonny:
+
+```bash
+export CHATGPT_EMAIL="tu_correo"
+export CHATGPT_PASSWORD="tu_password"
+python sonny.py
+```
+
+En Windows PowerShell:
+```powershell
+$env:CHATGPT_EMAIL="tu_correo"
+$env:CHATGPT_PASSWORD="tu_password"
+python sonny.py
+```
+
+> Si tu cuenta tiene 2FA/Captcha, Sonny intentará autologin y luego te dejará terminar manualmente en el navegador.
+
+---
+
 ## Archivos del proyecto
 
 ```
