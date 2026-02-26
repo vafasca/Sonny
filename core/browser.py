@@ -33,7 +33,7 @@ AI_SITES = {
         "input_sel":    '[contenteditable="true"]',
         "send_sel":     'button[aria-label="Send message"]',
         # Claude cambia seguido; usamos selector robusto + fallback en código.
-        "response_sel": 'div.font-claude-message, div.prose, div[data-testid*="assistant"], article',
+        "response_sel": 'div.font-claude-message, div[data-testid*="assistant-message"], div[data-testid*="assistant"], main article, main div.prose',
         "done_sel":     'button[aria-label="Send message"]:not([disabled])',
         "session_file": "claude_session",
     },
@@ -554,6 +554,49 @@ class BrowserSession:
 
         return best
 
+
+    async def _extract_latest_response_text_deep(self) -> str:
+        """Fallback profundo para DOMs cambiantes (especialmente Claude)."""
+        try:
+            return await self._page.evaluate("""
+                () => {
+                  const isVisible = (el) => {
+                    const r = el.getBoundingClientRect();
+                    const st = window.getComputedStyle(el);
+                    return r.width > 0 && r.height > 0 && st.visibility !== 'hidden' && st.display !== 'none';
+                  };
+
+                  const bad = [
+                    'nuevo chat','new chat','search chats','buscar chats','proyectos',
+                    'obtener plus','share','compartir','settings','configuración'
+                  ];
+
+                  const candidates = Array.from(document.querySelectorAll(`
+                    main [data-testid*="assistant"],
+                    main [data-testid*="message"],
+                    main article,
+                    main .prose,
+                    main [class*="markdown"],
+                    main p, main li
+                  `));
+
+                  let best = '';
+                  for (const el of candidates.slice(-400)) {
+                    if (!isVisible(el)) continue;
+                    if (el.closest('aside, nav, header, footer')) continue;
+                    const t = (el.innerText || '').trim();
+                    if (!t || t.length < 20) continue;
+                    const low = t.toLowerCase();
+                    if (bad.some(k => low.includes(k))) continue;
+                    if (t.length > best.length) best = t;
+                  }
+
+                  return best;
+                }
+            """)
+        except Exception:
+            return ""
+
     async def _wait_for_response(self, max_wait: int = 120) -> str:
         """Espera a que la IA termine de responder y devuelve el texto."""
         site = self.site
@@ -576,6 +619,8 @@ class BrowserSession:
 
             try:
                 current_text = await self._extract_latest_response_text()
+                if not current_text:
+                    current_text = await self._extract_latest_response_text_deep()
                 if current_text:
                     if current_text == last_text:
                         stable_count += 1
@@ -595,9 +640,11 @@ class BrowserSession:
                     if stable_count >= 2:
                         await asyncio.sleep(2)
                         latest = await self._extract_latest_response_text()
+                        if not latest:
+                            latest = await self._extract_latest_response_text_deep()
                         if latest:
                             return latest
             except Exception:
                 pass
 
-        return last_text or "No se pudo leer la respuesta."
+        return last_text or (await self._extract_latest_response_text_deep()) or "No se pudo leer la respuesta."
