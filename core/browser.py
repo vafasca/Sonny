@@ -1,6 +1,6 @@
 """
 core/browser.py — Controla el navegador con Playwright.
-Maneja sesiones persistentes para no re-loguearse cada vez.
+Maneja sesiones persistentes en Edge (perfil_edge) para no re-loguearse cada vez.
 USA PORTAPAPELES (pyperclip) para enviar prompts largos sin truncar.
 """
 import asyncio, os, sys, time, re
@@ -13,9 +13,13 @@ class C:
     CYAN="\033[96m"; GREEN="\033[92m"; YELLOW="\033[93m"
     RED="\033[91m";  BOLD="\033[1m";   DIM="\033[2m"; RESET="\033[0m"
 
-# ── Rutas de sesión ────────────────────────────────────────────────────────────
+# ── Rutas de sesión/perfil ─────────────────────────────────────────────────────
 SESSIONS_DIR = Path(__file__).parent.parent / "sessions"
 SESSIONS_DIR.mkdir(exist_ok=True)
+
+# Perfil persistente de Edge para automatización (aislado de tu Edge personal)
+EDGE_PROFILE_DIR = Path(__file__).parent.parent / "perfil_edge"
+EDGE_PROFILE_DIR.mkdir(exist_ok=True)
 
 # ── Configuración de cada IA ───────────────────────────────────────────────────
 AI_SITES = {
@@ -83,7 +87,6 @@ class BrowserSession:
             raise ValueError(f"Sitio desconocido: {site_key}. Opciones: {list(AI_SITES.keys())}")
         self.site     = AI_SITES[site_key]
         self.site_key = site_key
-        self.session_path = SESSIONS_DIR / self.site["session_file"]
         self._browser     = None
         self._context     = None
         self._page        = None
@@ -91,26 +94,28 @@ class BrowserSession:
         self._started     = False
 
     async def start(self):
-        """Inicia la sesión del navegador (si aún no está iniciada)."""
+        """Inicia una sesión persistente de Edge (msedge) si aún no está iniciada."""
         if self._started:
             return self
 
         from playwright.async_api import async_playwright
-        self._pw      = await async_playwright().start()
-        self._browser = await self._pw.chromium.launch(
+        self._pw = await async_playwright().start()
+        self._context = await self._pw.chromium.launch_persistent_context(
+            user_data_dir=str(EDGE_PROFILE_DIR),
+            channel="msedge",
             headless=False,
-            args=["--start-maximized"]
-        )
-        self._context = await self._browser.new_context(
-            storage_state=str(self.session_path) if self.session_path.exists() else None,
+            args=["--start-maximized"],
             viewport={"width": 1280, "height": 800},
             user_agent=(
                 "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
                 "AppleWebKit/537.36 (KHTML, like Gecko) "
                 "Chrome/120.0.0.0 Safari/537.36"
-            )
+            ),
         )
-        self._page = await self._context.new_page()
+
+        # launch_persistent_context ya abre una ventana; reutilizar primera pestaña.
+        pages = self._context.pages
+        self._page = pages[0] if pages else await self._context.new_page()
 
         # Dar permisos de clipboard al contexto para que Ctrl+V funcione
         await self._context.grant_permissions(["clipboard-read", "clipboard-write"])
@@ -118,14 +123,13 @@ class BrowserSession:
         return self
 
     async def close(self):
-        """Cierra la sesión y guarda estado si está iniciada."""
+        """Cierra la sesión persistente de Edge."""
         if not self._started:
             return
 
+        # En contexto persistente, cookies/sesión viven en EDGE_PROFILE_DIR.
         if self._context:
-            await self._context.storage_state(path=str(self.session_path))
-        if self._browser:
-            await self._browser.close()
+            await self._context.close()
         if self._pw:
             await self._pw.stop()
 
@@ -231,8 +235,7 @@ class BrowserSession:
     async def wait_for_login(self):
         """Intenta login automático (si hay credenciales) o espera login manual."""
         if await self._try_chatgpt_env_login():
-            await self._context.storage_state(path=str(self.session_path))
-            print(f"  {C.GREEN}✅ Sesión guardada en {self.session_path}{C.RESET}\n")
+            print(f"  {C.GREEN}✅ Sesión persistida en {EDGE_PROFILE_DIR}{C.RESET}\n")
             return
 
         print(f"\n  {C.YELLOW}{'─'*50}{C.RESET}")
@@ -242,8 +245,7 @@ class BrowserSession:
         print(f"  {C.DIM}El navegador está abierto. Loguéate y luego vuelve aquí.{C.RESET}")
         print(f"  {C.CYAN}Presiona ENTER cuando hayas iniciado sesión...{C.RESET}")
         input()
-        await self._context.storage_state(path=str(self.session_path))
-        print(f"  {C.GREEN}✅ Sesión guardada en {self.session_path}{C.RESET}\n")
+        print(f"  {C.GREEN}✅ Sesión persistida en {EDGE_PROFILE_DIR}{C.RESET}\n")
 
     # ──────────────────────────────────────────────────────────────────────────
     #   ENVIAR PROMPT — usa portapapeles para soportar texto de cualquier largo

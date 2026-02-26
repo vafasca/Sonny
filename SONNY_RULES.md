@@ -149,7 +149,7 @@ Dame los pasos corregidos para solucionar este error.
 
 ## Login persistente en ChatGPT
 
-- Sonny guarda cookies/sesión en `sessions/chatgpt_session`.
+- Sonny guarda cookies/sesión en `perfil_edge` usando Microsoft Edge (channel `msedge`).
 - Si inicias sesión una vez (manual o automático), debería persistir al cerrar/abrir Sonny.
 - Para login automático opcional (sin escribir usuario/clave en cada corrida), define estas variables de entorno antes de ejecutar Sonny:
 
