@@ -1,6 +1,6 @@
 """
 core/browser.py — Controla el navegador con Playwright.
-Maneja sesiones persistentes en Edge (perfil_edge) para no re-loguearse cada vez.
+Maneja sesiones persistentes en Edge (perfil_edge) y opcionalmente se conecta a Chrome real vía CDP.
 USA PORTAPAPELES (pyperclip) para enviar prompts largos sin truncar.
 """
 import asyncio, os, sys, time, re
@@ -20,6 +20,10 @@ SESSIONS_DIR.mkdir(exist_ok=True)
 # Perfil persistente de Edge para automatización (aislado de tu Edge personal)
 EDGE_PROFILE_DIR = Path(__file__).parent.parent / "perfil_edge"
 EDGE_PROFILE_DIR.mkdir(exist_ok=True)
+
+# Opción avanzada: conectarse a tu Chrome REAL vía CDP (tu propio perfil/sesión)
+USE_SYSTEM_CHROME = (os.environ.get("SONNY_USE_SYSTEM_CHROME") or "").strip().lower() in {"1","true","yes","si","sí"}
+CHROME_CDP_URL = (os.environ.get("SONNY_CHROME_CDP_URL") or "http://127.0.0.1:9222").strip()
 
 # ── Configuración de cada IA ───────────────────────────────────────────────────
 AI_SITES = {
@@ -92,38 +96,62 @@ class BrowserSession:
         self._page        = None
         self._pw          = None
         self._started     = False
+        self._using_system_chrome = False
+
+    async def _start_with_system_chrome(self) -> bool:
+        """Conecta Playwright a una instancia real de Chrome abierta con --remote-debugging-port."""
+        if not USE_SYSTEM_CHROME:
+            return False
+
+        try:
+            self._browser = await self._pw.chromium.connect_over_cdp(CHROME_CDP_URL)
+            self._using_system_chrome = True
+            contexts = self._browser.contexts
+            self._context = contexts[0] if contexts else await self._browser.new_context()
+            pages = self._context.pages
+            self._page = pages[0] if pages else await self._context.new_page()
+            print(f"  {C.GREEN}✅ Conectado a Chrome real por CDP: {CHROME_CDP_URL}{C.RESET}")
+            return True
+        except Exception as e:
+            print(f"  {C.YELLOW}⚠️ No pude conectar a Chrome real ({CHROME_CDP_URL}): {e}{C.RESET}")
+            print(f"  {C.DIM}   Fallback automático a Edge persistente (perfil_edge).{C.RESET}")
+            return False
 
     async def start(self):
-        """Inicia una sesión persistente de Edge (msedge) si aún no está iniciada."""
+        """Inicia navegador para automatización (Chrome real vía CDP o Edge persistente)."""
         if self._started:
             return self
 
         from playwright.async_api import async_playwright
         self._pw = await async_playwright().start()
-        self._context = await self._pw.chromium.launch_persistent_context(
-            user_data_dir=str(EDGE_PROFILE_DIR),
-            channel="msedge",
-            headless=False,
-            ignore_default_args=["--enable-automation"],
-            args=[
-                "--start-maximized",
-                "--disable-blink-features=AutomationControlled",
-                "--disable-infobars",
-            ],
-            viewport={"width": 1280, "height": 800},
-            user_agent=(
-                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                "AppleWebKit/537.36 (KHTML, like Gecko) "
-                "Chrome/120.0.0.0 Safari/537.36"
-            ),
-        )
 
-        # launch_persistent_context ya abre una ventana; reutilizar primera pestaña.
-        pages = self._context.pages
-        self._page = pages[0] if pages else await self._context.new_page()
+        self._using_system_chrome = False
+        connected_real = await self._start_with_system_chrome()
+        if not connected_real:
+            self._context = await self._pw.chromium.launch_persistent_context(
+                user_data_dir=str(EDGE_PROFILE_DIR),
+                channel="msedge",
+                headless=False,
+                ignore_default_args=["--enable-automation"],
+                args=[
+                    "--start-maximized",
+                    "--disable-blink-features=AutomationControlled",
+                    "--disable-infobars",
+                ],
+                viewport={"width": 1280, "height": 800},
+                user_agent=(
+                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                    "AppleWebKit/537.36 (KHTML, like Gecko) "
+                    "Chrome/120.0.0.0 Safari/537.36"
+                ),
+            )
 
-        # Reducir señales simples de webdriver para algunos flujos de login.
-        await self._context.add_init_script("Object.defineProperty(navigator, 'webdriver', {get: () => undefined});")
+            # launch_persistent_context ya abre una ventana; reutilizar primera pestaña.
+            pages = self._context.pages
+            self._page = pages[0] if pages else await self._context.new_page()
+
+            # Reducir señales simples de webdriver para algunos flujos de login.
+            await self._context.add_init_script("Object.defineProperty(navigator, 'webdriver', {get: () => undefined});")
 
         # Dar permisos de clipboard al contexto para que Ctrl+V funcione
         await self._context.grant_permissions(["clipboard-read", "clipboard-write"])
@@ -131,13 +159,22 @@ class BrowserSession:
         return self
 
     async def close(self):
-        """Cierra la sesión persistente de Edge."""
+        """Cierra sesión actual (sin matar tu Chrome real si se usa CDP)."""
         if not self._started:
             return
 
-        # En contexto persistente, cookies/sesión viven en EDGE_PROFILE_DIR.
-        if self._context:
-            await self._context.close()
+        if self._using_system_chrome:
+            # No cerrar navegador real del usuario; solo desconectar Playwright.
+            pass
+        else:
+            if self._context:
+                await self._context.close()
+
+        if self._browser:
+            try:
+                await self._browser.close()
+            except Exception:
+                pass
         if self._pw:
             await self._pw.stop()
 
@@ -146,6 +183,7 @@ class BrowserSession:
         self._page = None
         self._pw = None
         self._started = False
+        self._using_system_chrome = False
 
     async def __aenter__(self):
         return await self.start()

@@ -172,6 +172,29 @@ python sonny.py
 
 > Si ves "No se ha podido iniciar sesión", desactiva autologin y completa login manual en Edge para persistir sesión.
 
+
+- Alternativa para usar tu Chrome real (perfil real):
+
+```bash
+# 1) Abrir Chrome tú mismo con depuración remota
+"C:/Program Files/Google/Chrome/Application/chrome.exe" --remote-debugging-port=9222
+
+# 2) Activar modo Chrome real en Sonny
+export SONNY_USE_SYSTEM_CHROME="1"
+export SONNY_CHROME_CDP_URL="http://127.0.0.1:9222"
+python sonny.py
+```
+
+En PowerShell:
+```powershell
+& "C:/Program Files/Google/Chrome/Application/chrome.exe" --remote-debugging-port=9222
+$env:SONNY_USE_SYSTEM_CHROME="1"
+$env:SONNY_CHROME_CDP_URL="http://127.0.0.1:9222"
+python sonny.py
+```
+
+> Así Sonny se conecta a una ventana real de Chrome y navega allí; si no puede conectar, cae a Edge persistente.
+
 ---
 
 ## Archivos del proyecto
