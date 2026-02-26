@@ -10,6 +10,7 @@ sys.stderr.reconfigure(line_buffering=True)
 from core.ai           import interpret, test_providers, active_provider
 from core.agent        import run_agent, es_tarea_agente
 from core.orchestrator import run_orchestrator_with_site, detectar_navegadores
+from core.ai_scraper   import shutdown_ai_scraper_runtime
 from core.launcher     import launch
 from core.registry     import get_all, item_type
 from config            import PROVIDERS
@@ -96,6 +97,7 @@ def main():
             low = user_input.lower()
 
             if low in CMDS_SALIR:
+                shutdown_ai_scraper_runtime()
                 print(f"{C.CYAN}👋 Hasta luego.{C.RESET}"); break
             if low == "lista":   cmd_lista();  continue
             if low == "ayuda":   cmd_ayuda();  continue
@@ -161,7 +163,7 @@ def main():
                     print(f"{C.YELLOW}🤖 {accion.get('msg','')}{C.RESET}")
 
         except KeyboardInterrupt:
+            shutdown_ai_scraper_runtime()
             print(f"\n{C.CYAN}👋 Hasta luego.{C.RESET}"); break
-
 if __name__ == "__main__":
     main()

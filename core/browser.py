@@ -223,6 +223,40 @@ class BrowserSession:
                 pass
         return False
 
+    async def _wait_until_chatgpt_ready_after_login(self, timeout_s: int = 120) -> bool:
+        """Espera a que termine OAuth y ChatGPT vuelva a estar listo tras login manual."""
+        if self.site_key != "chatgpt":
+            return True
+
+        page = self._page
+        deadline = time.time() + timeout_s
+        last_err = ""
+
+        while time.time() < deadline:
+            try:
+                url = (page.url or "").lower()
+                if "accounts.google.com" in url or "auth.openai.com" in url:
+                    await asyncio.sleep(1)
+                    continue
+
+                if await page.query_selector(self.site["input_sel"]):
+                    if not await self._chatgpt_has_login_button():
+                        return True
+
+                await page.goto(self.site["url"], wait_until="domcontentloaded", timeout=20000)
+                await asyncio.sleep(1)
+                if await page.query_selector(self.site["input_sel"]):
+                    if not await self._chatgpt_has_login_button():
+                        return True
+            except Exception as e:
+                last_err = str(e)
+
+            await asyncio.sleep(1)
+
+        if last_err:
+            print(f"  {C.YELLOW}⚠️ ChatGPT aún no queda listo tras login: {last_err}{C.RESET}")
+        return False
+
     async def _try_chatgpt_env_login(self) -> bool:
         """Intenta login automático en ChatGPT con variables de entorno."""
         if self.site_key != "chatgpt":
@@ -257,8 +291,15 @@ class BrowserSession:
 
     async def needs_login(self) -> bool:
         """Detecta si la página pide login."""
-        await self._page.goto(self.site["url"], wait_until="domcontentloaded", timeout=30000)
-        await asyncio.sleep(2)
+        try:
+            await self._page.goto(self.site["url"], wait_until="domcontentloaded", timeout=30000)
+            await asyncio.sleep(2)
+        except Exception:
+            # Si hay navegación concurrente (OAuth en curso), tratar como login pendiente.
+            url_now = (self._page.url or "").lower()
+            if "accounts.google.com" in url_now or "auth.openai.com" in url_now:
+                return True
+
         url = (self._page.url or "").lower()
         login_signals = ["login", "signin", "sign-in", "auth", "account/login", "welcome"]
 
@@ -278,7 +319,7 @@ class BrowserSession:
         except Exception:
             pass
 
-        if any(s in url for s in login_signals):
+        if any(sig in url for sig in login_signals):
             return True
 
         return False
@@ -297,6 +338,9 @@ class BrowserSession:
         print(f"  {C.DIM}El navegador está abierto. Loguéate y luego vuelve aquí.{C.RESET}")
         print(f"  {C.CYAN}Presiona ENTER cuando hayas iniciado sesión...{C.RESET}")
         input()
+
+        # Esperar estabilización del flujo OAuth para evitar 'navigation interrupted'.
+        await self._wait_until_chatgpt_ready_after_login()
         print(f"  {C.GREEN}✅ Sesión persistida en {EDGE_PROFILE_DIR}{C.RESET}\n")
 
     # ──────────────────────────────────────────────────────────────────────────

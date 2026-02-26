@@ -169,6 +169,11 @@ def _shutdown_runtime_loop():
 atexit.register(_shutdown_runtime_loop)
 
 
+def shutdown_ai_scraper_runtime():
+    """Cierre explícito para salir sin tareas pendientes de Playwright."""
+    _shutdown_runtime_loop()
+
+
 async def _run_multiturn(prompts: list[str], site_key: str, objetivo: str) -> list[str]:
     """
     Una sesión del navegador, todos los prompts en secuencia.
@@ -227,11 +232,11 @@ async def _multiturn_async(prompts: list[str], preferred_site: str = None,
     if not check_playwright():
         install_playwright()
 
-    sites = (
-        [preferred_site] + [s for s in SITE_PRIORITY if s != preferred_site]
-        if preferred_site and preferred_site in AI_SITES
-        else list(SITE_PRIORITY)
-    )
+    if preferred_site and preferred_site in AI_SITES:
+        # Si el usuario eligió una IA concreta, no hacer fallback automático.
+        sites = [preferred_site]
+    else:
+        sites = list(SITE_PRIORITY)
 
     for site_key in sites:
         site_name = AI_SITES[site_key]["name"]
