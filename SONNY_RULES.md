@@ -167,6 +167,7 @@ python sonny.py
 ```
 
 > Si tu cuenta tiene 2FA/Captcha, Sonny intentará autologin y luego te dejará terminar manualmente en el navegador.
+> Si ChatGPT muestra **"Iniciar sesión"**, Sonny ahora lo tratará como modo invitado y forzará autenticación cuando detecte `CHATGPT_EMAIL`/`CHATGPT_PASSWORD`.
 
 ---
 

@@ -141,6 +141,13 @@ class BrowserSession:
     async def __aexit__(self, *args):
         await self.close()
 
+    def _chatgpt_env_credentials_set(self) -> bool:
+        """Indica si hay credenciales configuradas para login automático."""
+        if self.site_key != "chatgpt":
+            return False
+        return bool((os.environ.get("CHATGPT_EMAIL") or "").strip() and
+                    (os.environ.get("CHATGPT_PASSWORD") or "").strip())
+
     async def _chatgpt_has_login_button(self) -> bool:
         """Detecta botón de login visible en ChatGPT (incluye interfaz en español)."""
         if self.site_key != "chatgpt":
@@ -200,7 +207,16 @@ class BrowserSession:
         url = (self._page.url or "").lower()
         login_signals = ["login", "signin", "sign-in", "auth", "account/login", "welcome"]
 
-        # Si aparece el input de chat, no requiere login.
+        # ChatGPT: si aparece botón de login, consideramos sesión NO autenticada
+        # aunque exista input (modo invitado).
+        if self.site_key == "chatgpt":
+            try:
+                if await self._chatgpt_has_login_button():
+                    return True
+            except Exception:
+                pass
+
+        # Si aparece el input de chat y no hay señales de login, no requiere login.
         try:
             if await self._page.query_selector(self.site["input_sel"]):
                 return False
@@ -208,10 +224,6 @@ class BrowserSession:
             pass
 
         if any(s in url for s in login_signals):
-            return True
-
-        # ChatGPT sin sesión puede quedarse en home con botón "Iniciar sesión".
-        if self.site_key == "chatgpt" and await self._chatgpt_has_login_button():
             return True
 
         return False
@@ -251,6 +263,17 @@ class BrowserSession:
         if site_host not in current_url:
             await page.goto(site["url"], wait_until="domcontentloaded", timeout=30000)
             await asyncio.sleep(3)
+
+        # Si ChatGPT está en modo invitado y hay credenciales, forzar login.
+        if self.site_key == "chatgpt" and self._chatgpt_env_credentials_set():
+            try:
+                if await self._chatgpt_has_login_button():
+                    print(f"  {C.DIM}Detectado modo invitado en ChatGPT — intentando autenticar...{C.RESET}")
+                    await self.wait_for_login()
+                    await page.goto(site["url"], wait_until="domcontentloaded", timeout=30000)
+                    await asyncio.sleep(2)
+            except Exception:
+                pass
 
         # Esperar el input
         try:
