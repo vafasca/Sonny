@@ -9,6 +9,7 @@ from core.browser import BrowserSession, AI_SITES, check_playwright, install_pla
 from core.web_log  import log_prompt, log_response, log_error
 
 SITE_PRIORITY = ["claude", "chatgpt", "gemini", "qwen"]
+_PERSISTENT_SESSIONS: dict[str, BrowserSession] = {}
 
 
 def parse_steps(response: str) -> list[dict]:
@@ -110,28 +111,48 @@ async def _run_multiturn(prompts: list[str], site_key: str, objetivo: str) -> li
     site_name = AI_SITES[site_key]["name"]
     responses = []
 
-    async with BrowserSession(site_key) as session:
-        if await session.needs_login():
-            await session.wait_for_login()
-            await session._page.goto(
-                AI_SITES[site_key]["url"],
-                wait_until="domcontentloaded", timeout=30000
-            )
+    session = _PERSISTENT_SESSIONS.get(site_key)
+    if session is None:
+        session = BrowserSession(site_key)
+        _PERSISTENT_SESSIONS[site_key] = session
 
-        for idx, prompt in enumerate(prompts, 1):
-            print(f"  [Turno {idx}/{len(prompts)}] Enviando...", flush=True)
-            log_prompt(site_name, objetivo, prompt)
+    try:
+        await session.start()
+    except Exception:
+        # Si la sesión quedó en mal estado, recrearla
+        session = BrowserSession(site_key)
+        _PERSISTENT_SESSIONS[site_key] = session
+        await session.start()
 
+    if await session.needs_login():
+        await session.wait_for_login()
+        await session._page.goto(
+            AI_SITES[site_key]["url"],
+            wait_until="domcontentloaded", timeout=30000
+        )
+
+    for idx, prompt in enumerate(prompts, 1):
+        print(f"  [Turno {idx}/{len(prompts)}] Enviando...", flush=True)
+        log_prompt(site_name, objetivo, prompt)
+
+        try:
+            resp = await session.send_prompt(prompt)
+        except Exception:
+            # Si el usuario cerró manualmente la ventana, relanzar una sola vez
+            fresh = BrowserSession(site_key)
+            _PERSISTENT_SESSIONS[site_key] = fresh
+            await fresh.start()
+            session = fresh
             resp = await session.send_prompt(prompt)
 
-            if not resp or len(resp) < 20:
-                log_error(site_name, f"Turno {idx}: respuesta vacía")
-                print(f"  ⚠️  Turno {idx}: sin respuesta", flush=True)
-                responses.append("")
-            else:
-                log_response(site_name, resp, len(parse_steps(resp)))
-                print(f"  ✅ Turno {idx}: {len(resp)} chars", flush=True)
-                responses.append(resp)
+        if not resp or len(resp) < 20:
+            log_error(site_name, f"Turno {idx}: respuesta vacía")
+            print(f"  ⚠️  Turno {idx}: sin respuesta", flush=True)
+            responses.append("")
+        else:
+            log_response(site_name, resp, len(parse_steps(resp)))
+            print(f"  ✅ Turno {idx}: {len(resp)} chars", flush=True)
+            responses.append(resp)
 
     return responses
 

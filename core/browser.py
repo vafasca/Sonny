@@ -88,8 +88,13 @@ class BrowserSession:
         self._context     = None
         self._page        = None
         self._pw          = None
+        self._started     = False
 
-    async def __aenter__(self):
+    async def start(self):
+        """Inicia la sesión del navegador (si aún no está iniciada)."""
+        if self._started:
+            return self
+
         from playwright.async_api import async_playwright
         self._pw      = await async_playwright().start()
         self._browser = await self._pw.chromium.launch(
@@ -109,16 +114,32 @@ class BrowserSession:
 
         # Dar permisos de clipboard al contexto para que Ctrl+V funcione
         await self._context.grant_permissions(["clipboard-read", "clipboard-write"])
-
+        self._started = True
         return self
 
-    async def __aexit__(self, *args):
+    async def close(self):
+        """Cierra la sesión y guarda estado si está iniciada."""
+        if not self._started:
+            return
+
         if self._context:
             await self._context.storage_state(path=str(self.session_path))
         if self._browser:
             await self._browser.close()
         if self._pw:
             await self._pw.stop()
+
+        self._browser = None
+        self._context = None
+        self._page = None
+        self._pw = None
+        self._started = False
+
+    async def __aenter__(self):
+        return await self.start()
+
+    async def __aexit__(self, *args):
+        await self.close()
 
     async def needs_login(self) -> bool:
         """Detecta si la página pide login."""
@@ -150,9 +171,12 @@ class BrowserSession:
         site = self.site
         page = self._page
 
-        # Nueva conversación
-        await page.goto(site["url"], wait_until="domcontentloaded", timeout=30000)
-        await asyncio.sleep(3)
+        # Mantener chat actual: solo navegar al sitio si la pestaña no está en la IA.
+        current_url = (page.url or "").lower()
+        site_host = re.sub(r"^https?://", "", site["url"]).split("/")[0].lower()
+        if site_host not in current_url:
+            await page.goto(site["url"], wait_until="domcontentloaded", timeout=30000)
+            await asyncio.sleep(3)
 
         # Esperar el input
         try:
