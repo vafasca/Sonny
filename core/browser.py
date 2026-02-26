@@ -1,8 +1,10 @@
 """
 core/browser.py — Controla el navegador con Playwright.
 Maneja sesiones persistentes para no re-loguearse cada vez.
+USA PORTAPAPELES (pyperclip) para enviar prompts largos sin truncar.
 """
 import asyncio, os, sys, time, re
+import pyperclip
 from pathlib import Path
 from typing import Optional
 
@@ -72,6 +74,7 @@ def install_playwright():
     subprocess.run([sys.executable, "-m", "playwright", "install", "chromium"], check=True)
     print(f"  {C.GREEN}✅ Playwright instalado{C.RESET}")
 
+
 class BrowserSession:
     """Sesión de navegador persistente para una IA específica."""
 
@@ -89,12 +92,10 @@ class BrowserSession:
     async def __aenter__(self):
         from playwright.async_api import async_playwright
         self._pw      = await async_playwright().start()
-        # Usar chromium headless=False para poder loguearse
         self._browser = await self._pw.chromium.launch(
             headless=False,
             args=["--start-maximized"]
         )
-        # Sesión persistente — recuerda login
         self._context = await self._browser.new_context(
             storage_state=str(self.session_path) if self.session_path.exists() else None,
             viewport={"width": 1280, "height": 800},
@@ -105,10 +106,13 @@ class BrowserSession:
             )
         )
         self._page = await self._context.new_page()
+
+        # Dar permisos de clipboard al contexto para que Ctrl+V funcione
+        await self._context.grant_permissions(["clipboard-read", "clipboard-write"])
+
         return self
 
     async def __aexit__(self, *args):
-        # Guardar sesión para la próxima vez
         if self._context:
             await self._context.storage_state(path=str(self.session_path))
         if self._browser:
@@ -121,7 +125,6 @@ class BrowserSession:
         await self._page.goto(self.site["url"], wait_until="domcontentloaded", timeout=30000)
         await asyncio.sleep(2)
         url = self._page.url.lower()
-        # Señales de que no está logueado
         login_signals = ["login", "signin", "sign-in", "auth", "account/login", "welcome"]
         return any(s in url for s in login_signals)
 
@@ -132,64 +135,77 @@ class BrowserSession:
         print(f"  {C.DIM}El navegador está abierto. Loguéate y luego vuelve aquí.{C.RESET}")
         print(f"  {C.CYAN}Presiona ENTER cuando hayas iniciado sesión...{C.RESET}")
         input()
-        # Guardar sesión inmediatamente
         await self._context.storage_state(path=str(self.session_path))
         print(f"  {C.GREEN}✅ Sesión guardada en {self.session_path}{C.RESET}\n")
 
+    # ──────────────────────────────────────────────────────────────────────────
+    #   ENVIAR PROMPT — usa portapapeles para soportar texto de cualquier largo
+    # ──────────────────────────────────────────────────────────────────────────
+
     async def send_prompt(self, prompt: str) -> str:
         """
-        Envía el prompt completo como UN SOLO mensaje a la IA.
-        Devuelve el texto de la respuesta.
+        Envía el prompt completo a la IA usando Ctrl+V (portapapeles).
+        Soporta prompts de cualquier longitud sin truncar.
         """
         site = self.site
         page = self._page
 
-        # Navegar al chat nuevo (nueva conversación)
+        # Nueva conversación
         await page.goto(site["url"], wait_until="domcontentloaded", timeout=30000)
         await asyncio.sleep(3)
 
         # Esperar el input
         try:
             await page.wait_for_selector(site["input_sel"], timeout=15000)
-            await page.click(site["input_sel"])
-            await asyncio.sleep(0.5)
         except Exception as e:
             print(f"  {C.RED}Error encontrando input: {e}{C.RESET}")
             raise
 
-        # Escribir usando clipboard para ser más rápido y evitar problemas con caracteres especiales
+        # ── Copiar al portapapeles del sistema con pyperclip ──────────────────
         try:
-            await page.evaluate(f"""
-                const el = document.querySelector('{site["input_sel"]}');
-                if (!el) return;
-                el.focus();
-                const text = {repr(prompt)};
-                if (el.tagName === 'TEXTAREA' || el.tagName === 'INPUT') {{
-                    const nativeSetter = Object.getOwnPropertyDescriptor(
-                        window.HTMLTextAreaElement.prototype, 'value'
-                    )?.set || Object.getOwnPropertyDescriptor(
-                        window.HTMLInputElement.prototype, 'value'
-                    )?.set;
-                    if (nativeSetter) {{
-                        nativeSetter.call(el, text);
-                        el.dispatchEvent(new Event('input', {{ bubbles: true }}));
-                        el.dispatchEvent(new Event('change', {{ bubbles: true }}));
-                    }} else {{
-                        el.value = text;
-                    }}
-                }} else {{
-                    el.focus();
-                    document.execCommand('selectAll');
-                    document.execCommand('insertText', false, text);
-                }}
-            """)
-            await asyncio.sleep(1)
-        except Exception:
-            # Fallback: escribir tecla por tecla (más lento pero más compatible)
-            await page.keyboard.press("Control+a")
-            await page.keyboard.type(prompt[:500], delay=10)  # truncar para no ser muy lento
+            pyperclip.copy(prompt)
+            print(f"  {C.DIM}  Prompt copiado al portapapeles ({len(prompt)} chars){C.RESET}")
+        except Exception as e:
+            print(f"  {C.YELLOW}  ⚠️  pyperclip falló: {e} — usando método directo{C.RESET}")
+            await self._send_via_evaluate(prompt)
+            return await self._wait_for_response()
 
-        # Enviar con el botón o Enter
+        # ── Click en el input y pegar ─────────────────────────────────────────
+        await page.click(site["input_sel"])
+        await asyncio.sleep(0.5)
+
+        # Limpiar cualquier texto previo
+        await page.keyboard.press("Control+a")
+        await asyncio.sleep(0.2)
+        await page.keyboard.press("Delete")
+        await asyncio.sleep(0.3)
+
+        # Pegar con Ctrl+V
+        await page.keyboard.press("Control+v")
+        await asyncio.sleep(2)  # esperar a que pegue todo (prompts largos necesitan más)
+
+        # ── Verificar que llegó completo ──────────────────────────────────────
+        ok = await self._verify_paste(prompt)
+        if not ok:
+            print(f"  {C.YELLOW}  ⚠️  Pegado incompleto, reintentando...{C.RESET}")
+            await page.keyboard.press("Control+a")
+            await page.keyboard.press("Delete")
+            await asyncio.sleep(0.5)
+            pyperclip.copy(prompt)
+            await page.keyboard.press("Control+v")
+            await asyncio.sleep(2.5)
+
+            # Segundo intento fallido → fallback con evaluate
+            ok = await self._verify_paste(prompt)
+            if not ok:
+                print(f"  {C.YELLOW}  ⚠️  Usando método alternativo...{C.RESET}")
+                await page.keyboard.press("Control+a")
+                await page.keyboard.press("Delete")
+                await asyncio.sleep(0.3)
+                await self._send_via_evaluate(prompt)
+
+        # ── Enviar con botón o Enter ──────────────────────────────────────────
+        await asyncio.sleep(0.5)
         try:
             send_btn = await page.query_selector(site["send_sel"])
             if send_btn:
@@ -200,10 +216,74 @@ class BrowserSession:
             await page.keyboard.press("Enter")
 
         print(f"  {C.DIM}  Esperando respuesta de {site['name']}...{C.RESET}")
+        return await self._wait_for_response()
 
-        # Esperar a que la respuesta aparezca y se complete
-        response = await self._wait_for_response()
-        return response
+    async def _verify_paste(self, prompt: str) -> bool:
+        """
+        Verifica que el texto pegado en el input tenga al menos el 80% del prompt.
+        Devuelve True si está completo, False si está truncado.
+        """
+        try:
+            content = await self._page.evaluate(f"""
+                (() => {{
+                    const el = document.querySelector('{self.site["input_sel"]}');
+                    if (!el) return '';
+                    return el.innerText || el.value || el.textContent || '';
+                }})()
+            """)
+            ratio = len(content.strip()) / max(len(prompt), 1)
+            if ratio < 0.80:
+                print(f"  {C.DIM}  Verificación: {len(content)}/{len(prompt)} chars ({ratio:.0%}){C.RESET}")
+                return False
+            return True
+        except Exception:
+            return True  # si no podemos verificar, asumir OK
+
+    async def _send_via_evaluate(self, prompt: str):
+        """
+        Método alternativo: inserta el texto via JavaScript directamente.
+        Funciona para la mayoría de inputs aunque el prompt sea largo.
+        """
+        site = self.site
+        page = self._page
+        try:
+            await page.evaluate(f"""
+                (() => {{
+                    const el = document.querySelector('{site["input_sel"]}');
+                    if (!el) return;
+                    el.focus();
+                    const text = {repr(prompt)};
+                    if (el.tagName === 'TEXTAREA' || el.tagName === 'INPUT') {{
+                        const nativeSetter = Object.getOwnPropertyDescriptor(
+                            window.HTMLTextAreaElement.prototype, 'value'
+                        )?.set;
+                        if (nativeSetter) {{
+                            nativeSetter.call(el, text);
+                            el.dispatchEvent(new Event('input', {{ bubbles: true }}));
+                            el.dispatchEvent(new Event('change', {{ bubbles: true }}));
+                        }} else {{
+                            el.value = text;
+                        }}
+                    }} else {{
+                        // contenteditable (ChatGPT, Claude)
+                        el.focus();
+                        document.execCommand('selectAll');
+                        document.execCommand('insertText', false, text);
+                        // Fallback si execCommand no funciona
+                        if (!el.innerText || el.innerText.length < text.length * 0.5) {{
+                            el.innerText = text;
+                            el.dispatchEvent(new Event('input', {{ bubbles: true }}));
+                        }}
+                    }}
+                }})()
+            """)
+            await asyncio.sleep(1)
+        except Exception as e:
+            print(f"  {C.RED}  _send_via_evaluate falló: {e}{C.RESET}")
+
+    # ──────────────────────────────────────────────────────────────────────────
+    #   ESPERAR RESPUESTA
+    # ──────────────────────────────────────────────────────────────────────────
 
     async def _wait_for_response(self, max_wait: int = 120) -> str:
         """Espera a que la IA termine de responder y devuelve el texto."""
@@ -217,41 +297,37 @@ class BrowserSession:
             print(f"  {C.YELLOW}  Selector de respuesta no encontrado, esperando...{C.RESET}")
             await asyncio.sleep(5)
 
-        # Paso 2: Esperar a que el botón de enviar vuelva a estar activo
-        # (indica que la IA terminó de generar)
-        start = time.time()
-        last_text = ""
+        # Paso 2: Esperar a que el texto se estabilice (IA terminó de generar)
+        start       = time.time()
+        last_text   = ""
         stable_count = 0
 
         while time.time() - start < max_wait:
             await asyncio.sleep(2)
 
-            # Leer texto actual
             try:
                 elements = await page.query_selector_all(site["response_sel"])
                 if elements:
                     current_text = await elements[-1].inner_text()
                     current_text = current_text.strip()
 
-                    # Detectar si el texto dejó de cambiar (respuesta completa)
                     if current_text == last_text and current_text:
                         stable_count += 1
-                        if stable_count >= 3:  # 6 segundos sin cambios
+                        if stable_count >= 3:   # 6 segundos sin cambios → terminó
                             return current_text
                     else:
                         stable_count = 0
-                        last_text = current_text
+                        last_text    = current_text
             except Exception:
                 pass
 
-            # También verificar si el botón enviar está habilitado de nuevo
+            # También verificar si el botón de enviar está habilitado de nuevo
             try:
                 send_btn = await page.query_selector(site["done_sel"])
                 if send_btn and last_text:
                     stable_count += 1
                     if stable_count >= 2:
-                        await asyncio.sleep(2)  # dar un poco más de tiempo
-                        # Leer texto final
+                        await asyncio.sleep(2)
                         elements = await page.query_selector_all(site["response_sel"])
                         if elements:
                             return (await elements[-1].inner_text()).strip()
