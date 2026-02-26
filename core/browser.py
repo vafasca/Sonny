@@ -32,7 +32,8 @@ AI_SITES = {
         "name":         "Claude.ai",
         "input_sel":    '[contenteditable="true"]',
         "send_sel":     'button[aria-label="Send message"]',
-        "response_sel": ".font-claude-message",
+        # Claude cambia seguido; usamos selector robusto + fallback en código.
+        "response_sel": 'div.font-claude-message, div.prose, div[data-testid*="assistant"], article',
         "done_sel":     'button[aria-label="Send message"]:not([disabled])',
         "session_file": "claude_session",
     },
@@ -519,6 +520,40 @@ class BrowserSession:
     #   ESPERAR RESPUESTA
     # ──────────────────────────────────────────────────────────────────────────
 
+    async def _extract_latest_response_text(self) -> str:
+        """Extrae el último bloque de respuesta con selectores del sitio y fallback genérico."""
+        page = self._page
+        site = self.site
+
+        selectors = [site.get("response_sel", "")]
+        selectors += [
+            '[data-message-author-role="assistant"]',
+            'article',
+            'div.prose',
+            '.markdown, .markdown-body',
+            '[data-testid*="assistant"]',
+        ]
+
+        best = ""
+        for sel in selectors:
+            if not sel:
+                continue
+            try:
+                elements = await page.query_selector_all(sel)
+            except Exception:
+                continue
+            for el in elements[-8:]:
+                try:
+                    txt = (await el.inner_text()).strip()
+                except Exception:
+                    continue
+                if len(txt) > len(best):
+                    best = txt
+            if best and len(best) > 40:
+                return best
+
+        return best
+
     async def _wait_for_response(self, max_wait: int = 120) -> str:
         """Espera a que la IA termine de responder y devuelve el texto."""
         site = self.site
@@ -540,12 +575,9 @@ class BrowserSession:
             await asyncio.sleep(2)
 
             try:
-                elements = await page.query_selector_all(site["response_sel"])
-                if elements:
-                    current_text = await elements[-1].inner_text()
-                    current_text = current_text.strip()
-
-                    if current_text == last_text and current_text:
+                current_text = await self._extract_latest_response_text()
+                if current_text:
+                    if current_text == last_text:
                         stable_count += 1
                         if stable_count >= 3:   # 6 segundos sin cambios → terminó
                             return current_text
@@ -562,9 +594,9 @@ class BrowserSession:
                     stable_count += 1
                     if stable_count >= 2:
                         await asyncio.sleep(2)
-                        elements = await page.query_selector_all(site["response_sel"])
-                        if elements:
-                            return (await elements[-1].inner_text()).strip()
+                        latest = await self._extract_latest_response_text()
+                        if latest:
+                            return latest
             except Exception:
                 pass
 
