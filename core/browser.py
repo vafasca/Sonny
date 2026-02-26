@@ -104,7 +104,12 @@ class BrowserSession:
             user_data_dir=str(EDGE_PROFILE_DIR),
             channel="msedge",
             headless=False,
-            args=["--start-maximized"],
+            ignore_default_args=["--enable-automation"],
+            args=[
+                "--start-maximized",
+                "--disable-blink-features=AutomationControlled",
+                "--disable-infobars",
+            ],
             viewport={"width": 1280, "height": 800},
             user_agent=(
                 "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
@@ -116,6 +121,9 @@ class BrowserSession:
         # launch_persistent_context ya abre una ventana; reutilizar primera pestaña.
         pages = self._context.pages
         self._page = pages[0] if pages else await self._context.new_page()
+
+        # Reducir señales simples de webdriver para algunos flujos de login.
+        await self._context.add_init_script("Object.defineProperty(navigator, 'webdriver', {get: () => undefined});")
 
         # Dar permisos de clipboard al contexto para que Ctrl+V funcione
         await self._context.grant_permissions(["clipboard-read", "clipboard-write"])
@@ -151,6 +159,11 @@ class BrowserSession:
             return False
         return bool((os.environ.get("CHATGPT_EMAIL") or "").strip() and
                     (os.environ.get("CHATGPT_PASSWORD") or "").strip())
+
+    def _chatgpt_allow_automated_login(self) -> bool:
+        """Por defecto NO automatizamos login (Google puede bloquearlo)."""
+        v = (os.environ.get("CHATGPT_AUTOMATED_LOGIN") or "").strip().lower()
+        return v in {"1", "true", "yes", "si", "sí"}
 
     async def _chatgpt_has_login_button(self) -> bool:
         """Detecta botón de login visible en ChatGPT (incluye interfaz en español)."""
@@ -234,14 +247,15 @@ class BrowserSession:
 
     async def wait_for_login(self):
         """Intenta login automático (si hay credenciales) o espera login manual."""
-        if await self._try_chatgpt_env_login():
+        if self._chatgpt_allow_automated_login() and await self._try_chatgpt_env_login():
             print(f"  {C.GREEN}✅ Sesión persistida en {EDGE_PROFILE_DIR}{C.RESET}\n")
             return
 
         print(f"\n  {C.YELLOW}{'─'*50}{C.RESET}")
         print(f"  {C.YELLOW}🔐 Necesitas loguearte en {self.site['name']}{C.RESET}")
         if self.site_key == "chatgpt":
-            print(f"  {C.DIM}Opcional login automático: set CHATGPT_EMAIL y CHATGPT_PASSWORD.{C.RESET}")
+            print(f"  {C.DIM}Recomendado: login manual (Google bloquea logins automatizados).{C.RESET}")
+            print(f"  {C.DIM}Opcional riesgoso: CHATGPT_AUTOMATED_LOGIN=1 + CHATGPT_EMAIL/PASSWORD.{C.RESET}")
         print(f"  {C.DIM}El navegador está abierto. Loguéate y luego vuelve aquí.{C.RESET}")
         print(f"  {C.CYAN}Presiona ENTER cuando hayas iniciado sesión...{C.RESET}")
         input()
@@ -267,7 +281,7 @@ class BrowserSession:
             await asyncio.sleep(3)
 
         # Si ChatGPT está en modo invitado y hay credenciales, forzar login.
-        if self.site_key == "chatgpt" and self._chatgpt_env_credentials_set():
+        if self.site_key == "chatgpt" and self._chatgpt_env_credentials_set() and self._chatgpt_allow_automated_login():
             try:
                 if await self._chatgpt_has_login_button():
                     print(f"  {C.DIM}Detectado modo invitado en ChatGPT — intentando autenticar...{C.RESET}")

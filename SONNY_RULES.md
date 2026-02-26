@@ -151,9 +151,12 @@ Dame los pasos corregidos para solucionar este error.
 
 - Sonny guarda cookies/sesión en `perfil_edge` usando Microsoft Edge (channel `msedge`).
 - Si inicias sesión una vez (manual o automático), debería persistir al cerrar/abrir Sonny.
-- Para login automático opcional (sin escribir usuario/clave en cada corrida), define estas variables de entorno antes de ejecutar Sonny:
+- Recomendado: haz login manual una sola vez en esa ventana Edge; la sesión quedará en `perfil_edge`.
+- Google puede bloquear logins automatizados cuando detecta navegador controlado por tests.
+- Login automático queda como opción avanzada, habilitándolo explícitamente:
 
 ```bash
+export CHATGPT_AUTOMATED_LOGIN="1"
 export CHATGPT_EMAIL="tu_correo"
 export CHATGPT_PASSWORD="tu_password"
 python sonny.py
@@ -161,13 +164,13 @@ python sonny.py
 
 En Windows PowerShell:
 ```powershell
+$env:CHATGPT_AUTOMATED_LOGIN="1"
 $env:CHATGPT_EMAIL="tu_correo"
 $env:CHATGPT_PASSWORD="tu_password"
 python sonny.py
 ```
 
-> Si tu cuenta tiene 2FA/Captcha, Sonny intentará autologin y luego te dejará terminar manualmente en el navegador.
-> Si ChatGPT muestra **"Iniciar sesión"**, Sonny ahora lo tratará como modo invitado y forzará autenticación cuando detecte `CHATGPT_EMAIL`/`CHATGPT_PASSWORD`.
+> Si ves "No se ha podido iniciar sesión", desactiva autologin y completa login manual en Edge para persistir sesión.
 
 ---
 
