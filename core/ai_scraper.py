@@ -2,8 +2,9 @@
 core/ai_scraper.py
 
 Abre el navegador, envía prompts en secuencia y devuelve respuestas.
+v2: parse_steps soporta respuestas JSON además del formato texto original.
 """
-import asyncio, re
+import asyncio, re, json
 from core.browser import BrowserSession, AI_SITES, check_playwright, install_playwright, C
 from core.web_log  import log_prompt, log_response, log_error
 
@@ -11,6 +12,84 @@ SITE_PRIORITY = ["claude", "chatgpt", "gemini", "qwen"]
 
 
 def parse_steps(response: str) -> list[dict]:
+    """
+    Extrae pasos de la respuesta de la IA.
+    Soporta dos formatos:
+      1. JSON (formato preferido): {"steps": [{"description":..., "cmd":..., "files":[...]}]}
+      2. Texto con comandos (fallback): líneas que empiezan con npm/ng/pip/etc.
+    """
+    # Intento 1: JSON
+    json_steps = _parse_steps_json(response)
+    if json_steps is not None:
+        return json_steps
+
+    # Fallback: parseo de texto con comandos
+    return _parse_steps_text(response)
+
+
+def _parse_steps_json(response: str) -> list[dict] | None:
+    """Intenta extraer steps de una respuesta JSON."""
+    clean = response.strip()
+    # Quitar backticks de markdown
+    clean = re.sub(r'^```(?:json)?\s*', '', clean, flags=re.MULTILINE)
+    clean = re.sub(r'```\s*$', '', clean, flags=re.MULTILINE)
+    clean = clean.strip()
+
+    # Intentar parsear directamente
+    data = None
+    try:
+        data = json.loads(clean)
+    except json.JSONDecodeError:
+        # Buscar JSON embebido en texto
+        match = re.search(r'\{.*\}', clean, re.DOTALL)
+        if match:
+            try:
+                data = json.loads(match.group())
+            except json.JSONDecodeError:
+                pass
+
+    if not data:
+        return None
+
+    steps_raw = data.get("steps", [])
+    if not steps_raw:
+        # Si el JSON tiene cmd/files directamente (sin wrapper "steps")
+        if "cmd" in data or "files" in data:
+            steps_raw = [data]
+        else:
+            return None
+
+    result = []
+    SKIP_CMDS = ("ng serve", "npm start", "npm run dev", "cd ", "node -v", "npm -v")
+    ALLOWED_START = ("npm ", "npx ", "ng ", "pip ", "python ", "node ", "mkdir ", "git ")
+
+    for s in steps_raw:
+        if not isinstance(s, dict):
+            continue
+        cmd = s.get("cmd") or None
+        if cmd and isinstance(cmd, str):
+            cmd = cmd.strip()
+            if not cmd or cmd.upper() in ("NINGUNO", "NONE", "N/A", "NULL"):
+                cmd = None
+        # Filtrar comandos de desarrollo/arranque
+        if cmd and any(cmd.lower().startswith(sk) for sk in SKIP_CMDS):
+            cmd = None
+
+        step = {
+            "type": "json_step",
+            "description": s.get("description", s.get("desc", "")),
+            "cmd": cmd,
+            "files": s.get("files", []),
+        }
+        # Convertir a formato "cmd" simple para compatibilidad
+        if cmd:
+            result.append({"type": "cmd", "value": cmd})
+
+    return result if result else None
+
+
+def _parse_steps_text(response: str) -> list[dict]:
+    """Parser de texto original — extrae comandos de líneas de texto."""
     steps, seen = [], set()
     CMD_STARTS = ("npm ","npx ","ng ","pip ","python ","node ","mkdir ","git ")
     SKIP = ("ng serve","npm start","npm run ","cd ","node -v","npm -v")
@@ -27,7 +106,6 @@ def parse_steps(response: str) -> list[dict]:
 async def _run_multiturn(prompts: list[str], site_key: str, objetivo: str) -> list[str]:
     """
     Una sesión del navegador, todos los prompts en secuencia.
-    NO imprime mientras espera — imprime solo el resultado final.
     """
     site_name = AI_SITES[site_key]["name"]
     responses = []
@@ -44,7 +122,7 @@ async def _run_multiturn(prompts: list[str], site_key: str, objetivo: str) -> li
             print(f"  [Turno {idx}/{len(prompts)}] Enviando...", flush=True)
             log_prompt(site_name, objetivo, prompt)
 
-            resp = await session.send_prompt(prompt)   # espera respuesta completa
+            resp = await session.send_prompt(prompt)
 
             if not resp or len(resp) < 20:
                 log_error(site_name, f"Turno {idx}: respuesta vacía")
