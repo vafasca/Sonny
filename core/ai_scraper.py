@@ -32,6 +32,13 @@ ARTIFACT_ARCHIVE_MIME = {
     "application/gzip",
 }
 
+_CONTAMINATED_RESPONSE_MARKERS = (
+    "ARCHIVOS DE CONFIGURACIÓN ACTUALES (COMPLETOS):",
+    "ESTRUCTURA REAL DEL PROYECTO:",
+    "REGLAS CRÍTICAS:",
+    "Dame pasos corregidos en formato PASO/CMD/FILE",
+)
+
 # Runtime async persistente en hilo aparte para no romper objetos Playwright
 # entre múltiples llamadas síncronas a ask_ai_multiturn().
 _RUNTIME_LOOP: asyncio.AbstractEventLoop | None = None
@@ -242,6 +249,42 @@ def _parse_steps_text(response: str) -> list[dict]:
     return steps
 
 
+def _strip_isolated_segments(text: str) -> str:
+    """Elimina ruido de Cloudflare/iframes que a veces queda pegado al copiar DOM."""
+    clean = text or ""
+    clean = re.sub(r'\n?\s*Isolated Segment\s*\n\s*\(function\(\)\{.*?\}\)\(\);?', '', clean, flags=re.DOTALL)
+    clean = re.sub(r'window\.__CF\$cv\$params=.*?appendChild\(a\);', '', clean, flags=re.DOTALL)
+    return clean.strip()
+
+
+def _looks_like_prompt_echo(response: str, prompt: str) -> bool:
+    """
+    Detecta respuestas contaminadas donde Claude devuelve el prompt completo
+    (estructura, reglas, config) en lugar de un plan ejecutable.
+    """
+    if not response:
+        return False
+
+    if any(marker in response for marker in _CONTAMINATED_RESPONSE_MARKERS):
+        return True
+
+    prompt_norm = re.sub(r'\s+', ' ', (prompt or '').strip().lower())
+    resp_norm = re.sub(r'\s+', ' ', response.strip().lower())
+    if prompt_norm and len(prompt_norm) > 60 and prompt_norm in resp_norm:
+        if resp_norm.count('paso ') <= 1 and resp_norm.count('cmd:') <= 1:
+            return True
+
+    return False
+
+
+def _sanitize_response_for_execution(response: str, prompt: str) -> str:
+    """Limpia ruido y bloquea respuestas contaminadas para evitar ejecuciones incorrectas."""
+    clean = _strip_isolated_segments(response)
+    if _looks_like_prompt_echo(clean, prompt):
+        return ""
+    return clean
+
+
 def _runtime_loop_worker(loop: asyncio.AbstractEventLoop):
     asyncio.set_event_loop(loop)
     loop.run_forever()
@@ -342,14 +385,16 @@ async def _run_multiturn(prompts: list[str], site_key: str, objetivo: str) -> li
             session = fresh
             resp = await session.send_prompt(prompt)
 
-        if not resp or len(resp) < 20:
-            log_error(site_name, f"Turno {idx}: respuesta vacía")
-            print(f"  ⚠️  Turno {idx}: sin respuesta", flush=True)
+        clean_resp = _sanitize_response_for_execution(resp or "", prompt)
+        if not clean_resp or len(clean_resp) < 20:
+            reason = "respuesta vacía" if not (resp or "").strip() else "respuesta inválida/contaminada"
+            log_error(site_name, f"Turno {idx}: {reason}")
+            print(f"  ⚠️  Turno {idx}: sin respuesta usable", flush=True)
             responses.append("")
         else:
-            log_response(site_name, resp, len(parse_steps(resp)))
-            print(f"  ✅ Turno {idx}: {len(resp)} chars", flush=True)
-            responses.append(resp)
+            log_response(site_name, clean_resp, len(parse_steps(clean_resp)))
+            print(f"  ✅ Turno {idx}: {len(clean_resp)} chars", flush=True)
+            responses.append(clean_resp)
 
     return responses
 

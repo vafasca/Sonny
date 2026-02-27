@@ -654,7 +654,23 @@ def _p_fix_serve_strategy_change(objetivo: str, errors: str,
 # ═══════════════════════════════════════════════════════════════════
 #   PARSER
 # ═══════════════════════════════════════════════════════════════════
+_CONTAMINATED_PLAN_MARKERS = (
+    "Isolated Segment",
+    "window.__CF$cv$params",
+    "ARCHIVOS DE CONFIGURACIÓN ACTUALES (COMPLETOS):",
+    "REGLAS CRÍTICAS:",
+)
+
+
+def _response_is_contaminated(response: str) -> bool:
+    txt = response or ""
+    return any(m in txt for m in _CONTAMINATED_PLAN_MARKERS)
+
+
 def _parse_plan(response: str) -> list:
+    if _response_is_contaminated(response):
+        return []
+
     steps = _parse_structured(response)
     if not steps: steps = _parse_natural(response)
     BLOCK = ("npm install -g",)
