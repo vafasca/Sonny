@@ -520,10 +520,143 @@ class BrowserSession:
     #   ESPERAR RESPUESTA
     # ──────────────────────────────────────────────────────────────────────────
 
+    async def _extract_claude_conversation(self) -> dict:
+        """Extrae conversación Claude (usuario/asistente) y metadatos de adjuntos descargables."""
+        if self.site_key != "claude":
+            return {"latest": "", "messages": [], "artifacts": []}
+
+        try:
+            data = await self._page.evaluate("""
+                () => {
+                  const isVisible = (el) => {
+                    if (!el) return false;
+                    const r = el.getBoundingClientRect();
+                    const st = window.getComputedStyle(el);
+                    return r.width > 0 && r.height > 0 && st.visibility !== 'hidden' && st.display !== 'none';
+                  };
+
+                  const cleanText = (txt) => {
+                    const t = (txt || '')
+                      .replace(/\n?\s*Isolated Segment\s*\n\s*\(function\(\)\{[\s\S]*?\}\)\(\);?/gi, '')
+                      .replace(/window\.__CF\$cv\$params=[\s\S]*?appendChild\(a\);?/gi, '')
+                      .trim();
+                    return t;
+                  };
+
+                  const items = [];
+
+                  for (const el of document.querySelectorAll('[data-testid="user-message"]')) {
+                    const txt = cleanText(el.innerText || '');
+                    if (!txt) continue;
+                    items.push({ role: 'user', text: txt, node: el });
+                  }
+
+                  const assistantRoots = Array.from(document.querySelectorAll('[data-test-render-count], article, main [data-testid*="assistant"]'));
+                  for (const root of assistantRoots) {
+                    const candidate =
+                      root.querySelector('.font-claude-response, .font-claude-message, [data-testid*="assistant"], .prose') || root;
+                    if (!isVisible(candidate)) continue;
+                    const clone = candidate.cloneNode(true);
+                    clone.querySelectorAll('details, [data-testid*="thinking"], [data-testid*="think"], script, style').forEach(n => n.remove());
+                    const txt = cleanText(clone.innerText || '');
+                    if (!txt || txt.length < 8) continue;
+                    items.push({ role: 'assistant', text: txt, node: root });
+                  }
+
+                  items.sort((a, b) => {
+                    try {
+                      const pos = a.node.compareDocumentPosition(b.node);
+                      if (pos & Node.DOCUMENT_POSITION_FOLLOWING) return -1;
+                      if (pos & Node.DOCUMENT_POSITION_PRECEDING) return 1;
+                    } catch (e) {}
+                    return 0;
+                  });
+
+                  const artifacts = [];
+                  const artifactButtons = Array.from(document.querySelectorAll(
+                    'button[aria-label="Download"], button[aria-label="Descargar"], a[download], [data-testid*="download"]'
+                  ));
+
+                  for (const btn of artifactButtons.slice(-20)) {
+                    let name = '';
+                    let url = '';
+                    try {
+                      const anchor = btn.closest('a[href]') || btn.querySelector('a[href]');
+                      if (anchor && anchor.href) url = anchor.href;
+                    } catch (e) {}
+
+                    let el = btn;
+                    for (let i = 0; i < 10 && el; i++) {
+                      el = el.parentElement;
+                      if (!el) break;
+                      const textNodes = el.querySelectorAll('span, p, div, code');
+                      for (const t of textNodes) {
+                        const txt = (t.innerText || '').trim();
+                        if (!txt || txt.length > 120) continue;
+                        if (/\.[a-z0-9]{1,8}$/i.test(txt) && !txt.includes('\n')) {
+                          name = txt;
+                          break;
+                        }
+                      }
+                      if (name) break;
+                    }
+
+                    let preview = '';
+                    for (const sel of [
+                      '[data-testid="artifact-content"]', '.artifact-content',
+                      '[class*="preview" i] pre', '[class*="artifact" i] pre', 'pre code'
+                    ]) {
+                      const pre = document.querySelector(sel);
+                      if (!pre) continue;
+                      const txt = cleanText(pre.innerText || '');
+                      if (txt && txt.length > 10) {
+                        preview = txt.slice(0, 5000);
+                        break;
+                      }
+                    }
+
+                    if (name || url || preview) {
+                      artifacts.push({ filename: name || '', url: url || '', content: preview || '' });
+                    }
+                  }
+
+                  const msgs = items.map(m => ({ role: m.role, text: m.text }));
+                  const assistants = msgs.filter(m => m.role === 'assistant').map(m => m.text).filter(Boolean);
+                  const latest = assistants.length ? assistants[assistants.length - 1] : '';
+
+                  return { latest, messages: msgs, artifacts };
+                }
+            """)
+            if isinstance(data, dict):
+                return data
+        except Exception:
+            pass
+
+        return {"latest": "", "messages": [], "artifacts": []}
+
     async def _extract_latest_response_text(self) -> str:
         """Extrae el último bloque de respuesta con selectores del sitio y fallback genérico."""
         page = self._page
         site = self.site
+
+        if self.site_key == "claude":
+            conv = await self._extract_claude_conversation()
+            latest = (conv.get("latest") or "").strip()
+            if latest:
+                artifacts = conv.get("artifacts") or []
+                if artifacts:
+                    snippets = []
+                    for art in artifacts[:5]:
+                        name = (art.get("filename") or "").strip() or "artifact"
+                        url = (art.get("url") or "").strip()
+                        content = (art.get("content") or "").strip()
+                        if content:
+                            snippets.append(f"[artifact:{name}]\n{content}")
+                        elif url:
+                            snippets.append(f"[artifact:{name}] {url}")
+                    if snippets:
+                        latest = latest + "\n\n" + "\n\n".join(snippets)
+                return latest
 
         selectors = [site.get("response_sel", "")]
         selectors += [
