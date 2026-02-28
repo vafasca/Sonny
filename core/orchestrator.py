@@ -226,7 +226,14 @@ def _sanitize_content(content: str) -> str:
     while lines and not lines[0].strip(): lines = lines[1:]
     while lines and not lines[-1].strip(): lines = lines[:-1]
 
-    return "\n".join(lines)
+    cleaned = "\n".join(lines)
+
+    # ChatGPT a veces inyecta basura de DOM al inicio del bloque, p.ej.:
+    #   id="p7f8ti"import { ... }
+    # o atributos sueltos antes de código TS/HTML/CSS.
+    cleaned = re.sub(r'^(?:\s*[a-zA-Z_:][-\w:.]*\s*=\s*"[^"]*"\s*)+(?=\S)', '', cleaned)
+
+    return cleaned
 
 # ═══════════════════════════════════════════════════════════════════
 #   DETECCIÓN DE VERSIÓN ANGULAR
