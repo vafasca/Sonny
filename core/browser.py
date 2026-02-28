@@ -1,11 +1,10 @@
 """
-browser.py — v9  (Extracción por-IA totalmente separada)
+browser.py — v10  (Fix ChatGPT extracción de código + umbral de detección)
 ══════════════════════════════════════════════════════════════════════════════
 HISTORIAL DE FIXES
 ──────────────────────────────────────────────────────────────────────────────
 FIX 1 — PASTE LIMPIO:
-  PROBLEMA: Al pegar texto largo en el textarea, a veces se duplicaba o
-  el cursor quedaba mal posicionado.
+  PROBLEMA: Al pegar texto largo en el textarea, a veces se duplicaba.
   SOLUCIÓN: Un solo intento de paste vía pyperclip + clipboard.
 
 FIX 2 — RESPUESTA NUEVA (render-count, SOLO para Claude):
@@ -18,12 +17,29 @@ FIX 3 — TIMEOUT EXTENDIDO + ESPERA EXTRA (SOLO para Claude):
 
 FIX 4 — EXTRACCIÓN POR-IA TOTALMENTE AISLADA (v9):
   PROBLEMA: _COUNT_RENDERS_JS y _EXTRACT_NEW_RESPONSE_JS usaban
-  [data-test-render-count], un selector exclusivo de Claude. ChatGPT
-  nunca lo tiene → se quedaba esperando infinitamente.
-  SOLUCIÓN: Cada entrada de AI_SITES ahora incluye sus propios campos:
-    · "count_js"   → JS que devuelve el nº de respuestas actuales (int)
-    · "extract_js" → JS(prevCount) que devuelve el texto de la respuesta nueva
-  Así añadir/cambiar una IA nunca afecta a las demás.
+  [data-test-render-count], un selector exclusivo de Claude.
+  SOLUCIÓN: Cada entrada de AI_SITES tiene sus propios "count_js" y "extract_js".
+
+FIX 5 — CHATGPT: SELECTOR [class*="action"] DEMASIADO AMPLIO (v10):
+  PROBLEMA RAÍZ 1 — código en una sola línea:
+    El selector `[class*="action"]` eliminaba divs contenedores de bloques
+    de código de ChatGPT (usan clases como "code-action-bar", "actions").
+    Resultado: pre.textContent devolvía string vacío → innerText colapsaba
+    todo el bloque en una línea sin separadores.
+
+  PROBLEMA RAÍZ 2 — ng new no capturado (timeout 180s):
+    El mismo selector eliminaba el bloque que contenía el comando `ng new`.
+    `current` siempre devolvía "" → len("") <= 3 → no_text_count++  hasta
+    timeout → retornaba "No se pudo leer la respuesta." (29 chars).
+
+  SOLUCIÓN:
+    · Reemplazar `button, [class*="action"], [class*="feedback"]` por
+      selectores ESPECÍFICOS de los botones de ChatGPT (data-testid exactos).
+    · Procesar <br> DENTRO de <pre> ANTES de extraer textContent.
+    · Añadir manejo de spans de línea (syntax highlighters que usan
+      display:block via CSS en lugar de \n en text nodes).
+    · Bajar umbral de detección de `len > 40` a `len > 3`.
+    · Aumentar paciencia de `no_text_count >= 12` a `>= 20`.
 """
 import asyncio, os, sys, time, re
 import pyperclip
@@ -42,16 +58,7 @@ USE_SYSTEM_CHROME = (os.environ.get("SONNY_USE_SYSTEM_CHROME") or "").strip().lo
 CHROME_CDP_URL    = (os.environ.get("SONNY_CHROME_CDP_URL") or "http://127.0.0.1:9222").strip()
 
 # ══════════════════════════════════════════════════════════════════════════════
-#  CONFIGURACIÓN DE SITIOS — CADA IA TIENE SU PROPIA LÓGICA DE EXTRACCIÓN
-#
-#  count_js   → función JS que devuelve (int) cuántas respuestas hay ahora.
-#               Se llama ANTES de enviar el prompt para guardar la "línea base".
-#
-#  extract_js → función JS que recibe (prevCount: int) y devuelve (string)
-#               el texto de la respuesta nueva, o '' si todavía no hay.
-#
-#  Para agregar una nueva IA: solo rellena estos dos campos.
-#  Las IAs existentes NUNCA se tocan al agregar una nueva.
+#  CONFIGURACIÓN DE SITIOS
 # ══════════════════════════════════════════════════════════════════════════════
 
 AI_SITES = {
@@ -64,7 +71,6 @@ AI_SITES = {
         "response_sel": '[data-testid="assistant-message"], .font-claude-message, [class*="font-claude-message"]',
         "done_sel":     'button[aria-label="Send message"]:not([disabled]), button[aria-label="Enviar mensaje"]:not([disabled]), button[aria-label="Enviar"]:not([disabled])',
         "session_file": "claude_session",
-        # ── JS específico de Claude ──────────────────────────────────────────
         "count_js": r"""
             () => {
                 return document.querySelectorAll('[data-test-render-count]').length;
@@ -81,7 +87,6 @@ AI_SITES = {
                 const responseDiv = newest.querySelector('.font-claude-response') || newest;
                 const clone = responseDiv.cloneNode(true);
 
-                // Eliminar bloques de pensamiento interno
                 clone.querySelectorAll(
                     '[data-testid="thinking-block"], .thinking-block, details'
                 ).forEach(t => t.remove());
@@ -100,7 +105,8 @@ AI_SITES = {
         "response_sel": '[data-message-author-role="assistant"]',
         "done_sel":     'button[data-testid="send-button"]:not([disabled])',
         "session_file": "chatgpt_session",
-        # ── JS específico de ChatGPT ─────────────────────────────────────────
+
+        # ── count_js: cuenta respuestas completas (no estados "pensando") ─────
         "count_js": r"""
             () => {
                 return document.querySelectorAll(
@@ -108,6 +114,16 @@ AI_SITES = {
                 ).length;
             }
         """,
+
+        # ── extract_js v10: FIX selector action + br-inside-pre ──────────────
+        #
+        #  CAMBIOS vs v9:
+        #  1. Reemplaza `button, [class*="action"], [class*="feedback"]` por
+        #     data-testid EXACTOS → ya no elimina contenedores de código.
+        #  2. Procesa <br> DENTRO de <pre> ANTES de leer textContent.
+        #  3. Maneja spans de línea (syntax highlighters sin \n en text nodes).
+        #  4. Fallback a textContent completo si innerText devuelve muy poco.
+        #
         "extract_js": r"""
             (prevCount) => {
                 const msgs = Array.from(
@@ -116,34 +132,112 @@ AI_SITES = {
                 if (msgs.length <= prevCount) return '';
 
                 const newest = msgs[msgs.length - 1];
+
+                // ── Verificación rápida: hay contenido real? ──────────────────
+                // Usamos el DOM VIVO para verificar antes de clonar
+                const quickText = (newest.innerText || newest.textContent || '').trim();
+                if (!quickText || quickText.length < 2) return '';
+
                 const clone = newest.cloneNode(true);
 
-                // Quitar botones de acción (copiar, pulgar, etc.)
-                clone.querySelectorAll(
-                    'button, [data-testid="copy-turn-action-button"], ' +
-                    '[class*="action"], [class*="feedback"]'
-                ).forEach(el => el.remove());
+                // ── FIX 5a: Eliminar SOLO botones específicos de ChatGPT ──────
+                // ANTES (problemático): 'button, [class*="action"], [class*="feedback"]'
+                // Eso eliminaba divs contenedores de bloques de código.
+                // AHORA: solo data-testid exactos de botones de UI.
+                clone.querySelectorAll([
+                    '[data-testid="copy-turn-action-button"]',
+                    '[data-testid="thumbs-up-button"]',
+                    '[data-testid="thumbs-down-button"]',
+                    '[data-testid="voice-play-turn-action-button"]',
+                    '[data-testid="regenerate-button"]',
+                    '[data-testid="read-aloud-turn-action-button"]',
+                    // Botón de copiar dentro del bloque de código (el icono, no el contenido)
+                    '.code-block__copy-button',
+                    '.copybtn',
+                    'button[title="Copy"]',
+                    'button[aria-label="Copy"]',
+                    'button[aria-label="Copiar"]',
+                ].join(', ')).forEach(el => el.remove());
 
-                // ── FIX NEWLINES en código ────────────────────────────────
-                // Un nodo clonado/desconectado NO tiene CSS aplicado, así que
-                // innerText ignora white-space:pre y colapsa todo en una línea.
-                // Solución: reemplazar cada <pre> con un nodo de texto que
-                // contenga el textContent literal (que SÍ conserva los \n).
+                // ── FIX 5b: Procesar bloques <pre> preservando newlines ───────
+                //
+                // ORDEN CRÍTICO: primero convertir <br> DENTRO del <pre>,
+                // luego añadir \n en spans de línea, luego extraer textContent.
+                // En v9, los <br> globales se procesaban DESPUÉS de que el <pre>
+                // ya había sido reemplazado → los <br> internos quedaban perdidos.
+                //
                 clone.querySelectorAll('pre').forEach(pre => {
-                    const raw = '\n' + pre.textContent + '\n';
+
+                    // Paso A: <br> dentro del <pre> → \n explícito
+                    pre.querySelectorAll('br').forEach(br => {
+                        br.parentNode.replaceChild(
+                            document.createTextNode('\n'), br
+                        );
+                    });
+
+                    // Paso B: Syntax highlighters que usan spans con display:block
+                    // (PrismJS, highlight.js, ChatGPT custom) → añadir \n al final
+                    // de cada span de línea para que textContent los incluya.
+                    // Selectores comunes: .line, [class*="line "], token-line, etc.
+                    const lineSpans = pre.querySelectorAll(
+                        '.line, [class*=" line"], [class^="line"], ' +
+                        '.token-line, .code-line, [data-line]'
+                    );
+                    if (lineSpans.length > 1) {
+                        lineSpans.forEach(span => {
+                            const lastChild = span.lastChild;
+                            // Solo añadir \n si no termina ya con uno
+                            if (!lastChild ||
+                                lastChild.nodeType !== Node.TEXT_NODE ||
+                                !lastChild.textContent.endsWith('\n')) {
+                                span.appendChild(document.createTextNode('\n'));
+                            }
+                        });
+                    }
+
+                    // Paso C: Extraer textContent (ahora incluye \n de A y B)
+                    const rawText = pre.textContent;
+                    const withNewlines = '\n' + rawText + '\n';
                     pre.parentNode.replaceChild(
-                        document.createTextNode(raw), pre
+                        document.createTextNode(withNewlines), pre
                     );
                 });
 
-                // Convertir <br> a \n explícito antes de leer innerText
+                // ── FIX 5c: <br> fuera de <pre> (ya procesados los internos) ──
                 clone.querySelectorAll('br').forEach(br => {
                     br.parentNode.replaceChild(
                         document.createTextNode('\n'), br
                     );
                 });
 
-                return clone.innerText.trim();
+                // ── FIX 5d: <code> inline sin <pre> padre ─────────────────────
+                clone.querySelectorAll('code').forEach(code => {
+                    // Si el code YA estaba dentro de un pre, fue procesado arriba
+                    // y el pre fue reemplazado → este code ya no tiene padre pre
+                    // Solo procesar codes que aún existan en el clone
+                    if (code.isConnected && code.closest('pre') === null) {
+                        const raw = code.textContent;
+                        if (code.parentNode) {
+                            code.parentNode.replaceChild(
+                                document.createTextNode(raw), code
+                            );
+                        }
+                    }
+                });
+
+                const result = clone.innerText.trim();
+
+                // ── Fallback: si innerText devuelve muy poco pero quickText ──
+                // tiene bastante, usar textContent del clone como alternativa
+                if (result.length < 10 && quickText.length > result.length * 2) {
+                    // textContent no aplica CSS pero devuelve todo el texto
+                    const fallback = clone.textContent.trim();
+                    if (fallback.length > result.length) {
+                        return fallback;
+                    }
+                }
+
+                return result;
             }
         """,
     },
@@ -157,7 +251,6 @@ AI_SITES = {
         "response_sel": ".model-response-text",
         "done_sel":     'button[aria-label="Send message"]:not([disabled])',
         "session_file": "gemini_session",
-        # ── JS específico de Gemini ──────────────────────────────────────────
         "count_js": r"""
             () => {
                 return document.querySelectorAll('.model-response-text').length;
@@ -183,7 +276,6 @@ AI_SITES = {
         "response_sel": ".markdown-body",
         "done_sel":     'button[type="submit"]:not([disabled])',
         "session_file": "qwen_session",
-        # ── JS específico de Qwen ────────────────────────────────────────────
         "count_js": r"""
             () => {
                 return document.querySelectorAll('.markdown-body').length;
@@ -230,7 +322,6 @@ async def _query_first(page, selector_str: str):
     return None
 
 
-# JS para leer artefactos en iframes (Claude descarga archivos en iframes)
 _EXTRACT_ARTIFACT_JS = r"""
 () => {
   const results = [];
@@ -271,7 +362,7 @@ class BrowserSession:
         self._context             = None
         self._page                = None
         self._pw                  = None
-        self._started             = False          # ← guard anti-relanzamiento
+        self._started             = False
         self._using_system_chrome = False
         self._profile_dir = EDGE_PROFILES_DIR / f"profile_{site_key}"
         self._profile_dir.mkdir(exist_ok=True)
@@ -279,7 +370,6 @@ class BrowserSession:
     # ── Ciclo de vida ──────────────────────────────────────────────────────────
 
     async def _start_with_system_chrome(self) -> bool:
-        """Intenta conectar a Chrome/Edge vía CDP. Devuelve True si lo logra."""
         if not USE_SYSTEM_CHROME:
             return False
         try:
@@ -296,7 +386,6 @@ class BrowserSession:
             return False
 
     async def start(self):
-        # ── Guard: si ya está vivo, no relanzar ─────────────────────────────
         if self._started:
             return self
 
@@ -309,7 +398,7 @@ class BrowserSession:
         if not await self._start_with_system_chrome():
             self._context = await self._pw.chromium.launch_persistent_context(
                 str(self._profile_dir),
-                channel="msedge",                  # ← siempre Edge, todas las IAs
+                channel="msedge",
                 headless=False,
                 ignore_default_args=["--enable-automation"],
                 args=[
@@ -422,12 +511,9 @@ class BrowserSession:
             await self._wait_until_chatgpt_ready_after_login()
         print(f"  {C.GREEN}✅ Sesión persistida en {self._profile_dir}{C.RESET}\n")
 
-    # ══════════════════════════════════════════════════════════════════════════
-    #  EXTRACCIÓN POR-IA — usa los JS del diccionario AI_SITES
-    # ══════════════════════════════════════════════════════════════════════════
+    # ── Extracción por-IA ──────────────────────────────────────────────────────
 
     async def _count_responses(self) -> int:
-        """Cuenta las respuestas actuales usando el JS del sitio activo."""
         try:
             count = await self._page.evaluate(self.site["count_js"])
             return int(count or 0)
@@ -435,10 +521,6 @@ class BrowserSession:
             return 0
 
     async def _extract_new_response(self, prev_count: int) -> str:
-        """
-        Extrae la respuesta nueva usando el JS del sitio activo.
-        Devuelve '' si todavía no aparece el bloque nuevo.
-        """
         try:
             texto = await self._page.evaluate(self.site["extract_js"], prev_count)
             return (texto or "").strip()
@@ -450,7 +532,6 @@ class BrowserSession:
     async def _is_generating(self) -> bool:
         page = self._page
         site = self.site
-        # Si el botón de envío ya está habilitado → terminó
         for sel in site["done_sel"].split(","):
             sel = sel.strip()
             if not sel: continue
@@ -458,7 +539,6 @@ class BrowserSession:
                 btn = await page.query_selector(sel)
                 if btn: return False
             except Exception: continue
-        # Selectores genéricos de "stop/spinner"
         for sel in [
             'button[aria-label="Stop"]', 'button[aria-label="Detener"]',
             'button[aria-label="Stop generating"]', '[data-testid="stop-button"]',
@@ -496,15 +576,19 @@ class BrowserSession:
         return "\n\n".join(parts) if parts else ""
 
     # ══════════════════════════════════════════════════════════════════════════
-    #  WAIT FOR RESPONSE — v9
-    #  · Usa _count_responses() y _extract_new_response() (por-IA)
-    #  · Claude: max_wait=360s + espera extra 120s si sigue generando
-    #  · ChatGPT/otros: max_wait=180s (suficiente para respuestas normales)
+    #  WAIT FOR RESPONSE — v10
+    #
+    #  CAMBIOS vs v9:
+    #  · Umbral de detección: len > 40  →  len > 3
+    #    Motivo: respuestas cortas como "ng new ..." (< 40 chars) nunca
+    #    superaban el umbral → no_text_count++ hasta timeout.
+    #  · no_text_count >= 12  →  >= 20
+    #    Más paciencia antes de rendirse cuando last_txt es vacío.
+    #  · Log de diagnóstico mejorado.
     # ══════════════════════════════════════════════════════════════════════════
 
     async def _wait_for_response(self, max_wait: int = 0,
                                   prev_count: int = 0) -> str:
-        # Ajustar timeout por defecto según la IA
         if max_wait == 0:
             max_wait = 360 if self.site_key == "claude" else 180
 
@@ -524,7 +608,10 @@ class BrowserSession:
             except Exception:
                 current = ""
 
-            if current and len(current) > 40:
+            # ── FIX 5e: Umbral bajado de > 40 a > 3 ─────────────────────────
+            # Antes: respuestas cortas (comandos de 1 línea) nunca superaban
+            # el umbral → se iban directo a no_text_count++ → timeout.
+            if current and len(current) > 3:
                 no_text_count = 0
                 if not new_appeared:
                     new_appeared = True
@@ -534,7 +621,6 @@ class BrowserSession:
                     stable += 1
                     if stable >= 3:
                         if not await self._is_generating():
-                            # Agregar artefactos iframe si los hay (solo Claude los usa)
                             if self.site_key == "claude":
                                 try:
                                     artifact_text = await self._extract_from_artifacts()
@@ -552,15 +638,17 @@ class BrowserSession:
             else:
                 no_text_count += 1
                 if no_text_count == 8:
-                    print(f"  {C.YELLOW}  ⚠️  Aún esperando nueva respuesta...{C.RESET}")
-                if no_text_count >= 12 and last_txt:
+                    elapsed = int(time.time() - start)
+                    print(f"  {C.YELLOW}  ⚠️  Aún esperando nueva respuesta... ({elapsed}s){C.RESET}")
+                # ── FIX 5e: Paciencia aumentada de >= 12 a >= 20 ─────────────
+                # Más tiempo antes de devolver last_txt cuando es vacío.
+                if no_text_count >= 20 and last_txt:
                     if not await self._is_generating():
                         return last_txt
 
-        # ── Timeout alcanzado ─────────────────────────────────────────────────
+        # ── Timeout ───────────────────────────────────────────────────────────
         txt = last_txt
         if txt:
-            # Espera extra solo para Claude (razonamiento extendido puede durar mucho)
             if self.site_key == "claude" and await self._is_generating():
                 print(f"  {C.YELLOW}  ⚠️  Timeout ({max_wait}s) pero Claude sigue generando — "
                       f"esperando hasta 120s más...{C.RESET}")
@@ -600,7 +688,7 @@ class BrowserSession:
         return "No se pudo leer la respuesta."
 
     # ══════════════════════════════════════════════════════════════════════════
-    #  ENVIAR TEXTO AL INPUT — FIX 1: un solo intento de paste
+    #  ENVIAR TEXTO AL INPUT
     # ══════════════════════════════════════════════════════════════════════════
 
     async def _send_via_clipboard(self, el, text: str):
@@ -645,13 +733,11 @@ class BrowserSession:
         site = self.site
         page = self._page
 
-        # Navegar al sitio si hace falta
         site_host = re.sub(r"^https?://", "", site["url"]).split("/")[0].lower()
         if site_host not in (page.url or "").lower():
             await page.goto(site["url"], wait_until="domcontentloaded", timeout=30000)
             await asyncio.sleep(3)
 
-        # Login automático de ChatGPT (si está configurado)
         if (self.site_key == "chatgpt"
                 and self._chatgpt_env_credentials_set()
                 and self._chatgpt_allow_automated_login()):
@@ -662,7 +748,6 @@ class BrowserSession:
                     await asyncio.sleep(2)
             except Exception: pass
 
-        # Esperar input
         try:
             await page.wait_for_selector(site["input_sel"], timeout=15000)
         except Exception as e:
@@ -674,11 +759,9 @@ class BrowserSession:
             else:
                 print(f"  {C.RED}Error encontrando input: {e}{C.RESET}"); raise
 
-        # ── Contar respuestas previas ANTES de enviar ────────────────────────
         prev_count = await self._count_responses()
         print(f"    Respuestas previas en DOM: {prev_count}")
 
-        # ── Copiar prompt al portapapeles y pegarlo ──────────────────────────
         pyperclip.copy(prompt)
         print(f"    Prompt copiado al portapapeles ({len(prompt)} chars)")
 
@@ -688,7 +771,6 @@ class BrowserSession:
 
         await self._send_via_clipboard(input_el, prompt)
 
-        # Verificar que el texto llegó; si no, usar evaluate como fallback
         try:
             val = await input_el.evaluate(
                 "el => el.isContentEditable ? el.innerText : el.value"
@@ -699,7 +781,6 @@ class BrowserSession:
         except Exception:
             pass
 
-        # ── Enviar (click en botón) ──────────────────────────────────────────
         await asyncio.sleep(0.5)
         send_el = await _query_first(page, site["send_sel"])
         if send_el:
@@ -708,13 +789,12 @@ class BrowserSession:
             mod = "Meta" if sys.platform == "darwin" else "Control"
             await input_el.press("Enter")
 
-        # ── Esperar respuesta ────────────────────────────────────────────────
         print(f"    Esperando respuesta de {site['name']}...")
         return await self._wait_for_response(prev_count=prev_count)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-#  SHUTDOWN — cierra sesiones activas globalmente
+#  SHUTDOWN
 # ══════════════════════════════════════════════════════════════════════════════
 
 _active_sessions: dict[str, BrowserSession] = {}

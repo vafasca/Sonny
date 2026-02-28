@@ -1,54 +1,56 @@
 """
-core/orchestrator.py  v12.0 — Orquestador Sonny
+core/orchestrator.py  v12.2 — Orquestador Sonny
 
-NUEVO en v12.0 — FIX LOOP SIN LÍMITE + FORMATO FORZADO:
-  PROBLEMA: Cuando la IA respondía sin formato PASO/CMD/FILE (ej: texto libre
-  como "Diagnosticando..."), fix_steps quedaba vacío y se hacía break,
-  abandonando el intento de corrección sin siquiera ejecutar nada.
+NUEVO en v12.2 — RETRY DE NG NEW + DETECCIÓN ROBUSTA:
+  PROBLEMA 1 — ng new no detectado (timeout 180s en browser):
+    Threshold `len > 40` bloqueaba respuestas cortas como "ng new mi-app" (14 chars).
+    no_text_count++ sin parar → timeout 180s → "No se pudo leer la respuesta."
+    FIX browser.py (v10): threshold bajado a `> 3`, paciencia de 12 a 20 iters.
+
+  PROBLEMA 2 — Código en una sola línea (ChatGPT):
+    El selector `[class*="action"]` eliminaba contenedores de bloques de código
+    → innerText colapsaba código sin newlines → "Códigoimport { Component }..."
+    FIX browser.py (v10): selectores data-testid exactos + procesado de <br>
+    dentro de <pre> + spans de línea de syntax highlighters.
+
+  PROBLEMA 3 — Sin reintento cuando browser falla al capturar ng new:
+    Orquestador caía directo al default sin dar otra oportunidad.
+    FIX orchestrator.py (v12.2): Si resp == "No se pudo leer la respuesta",
+    reintenta UNA vez el Turno 2. _extract_ng_new() centraliza la lógica.
+
+NUEVO en v12.1 — INTEGRACIÓN DE PARSER GENÉRICO DE BLOQUES:
+  PROBLEMA: ChatGPT (y otros modelos) devuelven respuestas donde los saltos
+  de línea dentro de bloques ``` están escapados como \\n literales.
+  Esto hace que todo el contenido de un FILE quede en una sola línea,
+  rompiendo la compilación Angular y la escritura de archivos.
 
   SOLUCIÓN:
-  1. Loop infinito (sin max_fix_rounds) — Ctrl+C para detener
-  2. Cuando fix_steps está vacío → reintentar con prompt ultra-explícito
-     (_p_fix_serve_force_format) que exige formato PASO/CMD/FILE estricto
-  3. Mostrar cada error al usuario con bloque visual claro
-  4. Mostrar correcciones en el mismo formato PASO X/N que los pasos normales
-  5. Anti-bucle: si mismos errores 3 rondas seguidas sin cambios → cambio de estrategia
+  · Importa core/code_parser.py con normalize_newlines() y extract_code_blocks()
+  · _sanitize_content() ahora llama a normalize_newlines() como primer paso.
+  · _parse_structured() normaliza tanto las líneas del plan como el contenido
+    de cada bloque FILE antes de escribirlo.
+  · _parse_plan() usa extract_code_blocks() como fallback cuando el formato
+    PASO/CMD/FILE no produce resultados (respuesta libre de ChatGPT).
+  · Nueva función _extract_files_from_raw() que convierte bloques ``` genéricos
+    en steps ejecutables aunque el modelo no haya seguido el formato exacto.
 
-v11.6 — FIX _strip_concat_lang PARA CHATGPT EN ESPAÑOL:
-  PROBLEMA: ChatGPT responde en español con "Código:host {" (sin espacio entre
-  la etiqueta y el código). La versión anterior hacía `continue` cuando
-  rest[0] == ':' — correcto para evitar stripear "python:" solo, pero incorrecto
-  para "Código:host {" donde ':' es el separador real antes del código.
-  SOLUCIÓN: Si rest[0] == ':' y hay contenido real después → stripear label + ':'
-  Ahora "Código:host {" → ":host {" y "código:host {" → ":host {".
-  Claude no se ve afectado: usa etiquetas en inglés ("typescript", "bash") sin ':'.
-
-v11.5 — FIX ETIQUETAS DE LENGUAJE CONCATENADAS:
-  PROBLEMA: Claude.ai renderiza los bloques de código con la etiqueta de
-  lenguaje pegada al código en el innerText del DOM:
-    'bashng new ...'  en vez de  'bash\nng new ...'
-    'typescriptimport ...'  en vez de  'import ...'
-    'htmlimport ...'  en vez de  '<div ...'
-    'csshtml {...}'  en vez de  '.html {...}'
-  
-  FIX: Nueva función _strip_concat_lang(line) que detecta y elimina
-  etiquetas de lenguaje concatenadas al inicio de cada línea.
-
-v11.4 — BUG-FIXES anteriores (mantenidos):
-  - Angular 17+ standalone
-  - Anti-loop v2 con error codes
-  - Contexto mejorado en Turno 3
-  - Validación semántica heurística
-  - JSONL logging
-  - Validación de dependencias
+v12.0 — FIX LOOP SIN LÍMITE + FORMATO FORZADO (mantenido).
+v11.6 — FIX _strip_concat_lang PARA CHATGPT EN ESPAÑOL (mantenido).
+v11.5 — FIX ETIQUETAS DE LENGUAJE CONCATENADAS (mantenido).
 """
 
 import os, subprocess, re, shutil, json, hashlib
 from pathlib import Path
 from datetime import datetime
-from core.ai_scraper import ask_ai_multiturn
-from core.browser    import AI_SITES
-from core.web_log    import (
+from core.ai_scraper  import ask_ai_multiturn
+from core.browser     import AI_SITES
+from core.code_parser import (
+    normalize_newlines,
+    fix_content_newlines,
+    extract_code_blocks,
+    blocks_to_files,
+)
+from core.web_log import (
     log_session_start, log_error,
     log_build_error, log_fix_applied, log_autofix,
     log_dependency_warning, log_session_end,
@@ -114,19 +116,8 @@ def _strip_concat_lang(line: str) -> str:
     Casos que maneja:
       "bashng new ..."        → "ng new ..."         (Claude, sin separador)
       "typescriptimport ..."  → "import ..."         (Claude, sin separador)
-      "Código:host {"         → ":host {"  → ":host {" (ChatGPT ES, sep ':')
-      "código:host {"         → ":host {"             (ChatGPT ES, sep ':')
-
-    Lógica de separadores:
-      · Sin separador (rest[0] es código directo) → stripear label
-      · Separador ':' con contenido real después   → stripear label + ':'
-        (ChatGPT en español pone "Código:" antes del código)
-      · Separador ' ' o '\\t' → la etiqueta estaba sola en su línea pero
-        innerText las unió con espacio → devolver el resto desde el primer
-        carácter no-espacio
-
-    NOTA: Claude usa etiquetas en inglés sin ':' (typescript, bash, html),
-    por lo que este cambio no altera su comportamiento.
+      "Código:host {"         → ":host {"            (ChatGPT ES, sep ':')
+      "código:host {"         → ":host {"            (ChatGPT ES, sep ':')
     """
     stripped = line.strip()
     low      = stripped.lower()
@@ -135,20 +126,15 @@ def _strip_concat_lang(line: str) -> str:
         if low.startswith(label) and len(stripped) > len(label):
             rest = stripped[len(label):]
 
-            # Separador espacio/tab → etiqueta estaba en línea propia,
-            # innerText las juntó; devolver el resto sin espacios iniciales.
             if rest and rest[0] in (' ', '\t'):
                 remainder = rest.lstrip()
                 if remainder:
                     return remainder
                 continue
 
-            # Separador ':' → ChatGPT ES pone "Código:" antes del código.
-            # Si hay contenido real después del ':', stripear label + ':'.
             if rest and rest[0] == ':' and len(rest) > 1:
                 return rest[1:].lstrip()
 
-            # Sin separador → label pegada directamente al código (Claude).
             if rest:
                 return rest
 
@@ -186,7 +172,7 @@ def P(text: str = "", end: str = "\n"):
     print(text, end=end, flush=True)
 
 # ═══════════════════════════════════════════════════════════════════
-#   SANITIZACIÓN — v11.6 con strip de etiquetas concatenadas
+#   SANITIZACIÓN v12.1 — normalize_newlines integrado
 # ═══════════════════════════════════════════════════════════════════
 
 _CONTENT_PREFIXES = {
@@ -199,11 +185,19 @@ _CONTENT_PREFIXES = {
 def _sanitize_content(content: str) -> str:
     """
     Limpia el contenido de archivos antes de escribirlos al disco.
+
+    v12.1: Primer paso es normalize_newlines() para corregir \\n literales
+    de ChatGPT. Luego aplica el resto del pipeline de limpieza.
+
     v11.6: También stripea etiquetas concatenadas (bashng, typescriptimport,
            Código:host, etc.)
     """
     if not content:
         return content
+
+    # ── v12.1: normalizar \\n literales ANTES de splitlines() ────────────────
+    content = normalize_newlines(content)
+
     lines = content.splitlines()
 
     if lines and lines[0].strip().startswith("```"):
@@ -268,7 +262,7 @@ def _get_files_hash(project_dir: Path) -> str:
     return hasher.hexdigest()
 
 # ═══════════════════════════════════════════════════════════════════
-#   CONTEXTO DE ARCHIVOS CLAVE (Mejora 7)
+#   CONTEXTO DE ARCHIVOS CLAVE
 # ═══════════════════════════════════════════════════════════════════
 
 _KEY_CONFIGS_MODERN = [
@@ -297,7 +291,7 @@ def _get_key_context_files(project_dir: Path, ng_major: int) -> dict:
     return result
 
 # ═══════════════════════════════════════════════════════════════════
-#   VALIDACIÓN SEMÁNTICA (Mejora 8)
+#   VALIDACIÓN SEMÁNTICA
 # ═══════════════════════════════════════════════════════════════════
 
 _SEMANTIC_MAP = [
@@ -334,7 +328,7 @@ def _semantic_validation_warning(objetivo: str, project_dir: Path):
         P(f"  {C.DIM}    (puede ser falso positivo — revisar manualmente){C.RESET}")
 
 # ═══════════════════════════════════════════════════════════════════
-#   VALIDACIÓN DE DEPENDENCIAS (Mejora 11)
+#   VALIDACIÓN DE DEPENDENCIAS
 # ═══════════════════════════════════════════════════════════════════
 
 _BUILTIN_PKGS = {
@@ -745,10 +739,6 @@ def _p_fix_serve_strategy_change(objetivo: str, errors: str,
 
 def _p_fix_serve_force_format(objetivo: str, errors: str,
                                project_dir: Path, tools_str: str, ng_major: int=17) -> str:
-    """
-    v12.0: Prompt ultra-explícito cuando la IA no respondió en formato PASO/CMD/FILE.
-    Exige formato estricto sin texto libre.
-    """
     _, key_files = _scan_project(project_dir)
     key_config = _get_key_context_files(project_dir, ng_major)
     config_ctx = ""
@@ -778,7 +768,65 @@ def _p_fix_serve_force_format(objetivo: str, errors: str,
     )
 
 # ═══════════════════════════════════════════════════════════════════
-#   PARSER — v11.6: strip de etiquetas concatenadas en FILE content
+#   EXTRACCIÓN GENÉRICA DE ARCHIVOS DESDE BLOQUES ``` — v12.1 NUEVO
+# ═══════════════════════════════════════════════════════════════════
+
+# Mapa de extensiones comunes a rutas relativas en Angular
+_EXT_TO_ANGULAR_PATH = {
+    "html": "src/app/app.component.html",
+    "css":  "src/app/app.component.css",
+    "scss": "src/app/app.component.scss",
+    "ts":   "src/app/app.component.ts",
+}
+
+def _extract_files_from_raw(response: str, project_dir: Path | None = None) -> list[dict]:
+    """
+    v12.1: Fallback genérico — extrae bloques ``` de una respuesta libre
+    y los convierte en steps ejecutables con archivos listos para escribir.
+
+    Útil cuando ChatGPT devuelve código sin seguir el formato PASO/CMD/FILE.
+    Usa extract_code_blocks() de code_parser.py para el parseo.
+
+    Returns:
+        Lista de steps en formato interno del orquestador.
+    """
+    blocks = extract_code_blocks(response)
+    if not blocks:
+        return []
+
+    files_out = blocks_to_files(blocks, base_name="component")
+    if not files_out:
+        return []
+
+    # Construir un step sintético con todos los archivos
+    step_files = []
+    for f in files_out:
+        # Si estamos en un proyecto Angular, intentar mapear a ruta real
+        target_path = f["path"]
+        if project_dir and f["ext"] in _EXT_TO_ANGULAR_PATH:
+            candidate = _EXT_TO_ANGULAR_PATH[f["ext"]]
+            real_path = project_dir / candidate
+            if real_path.parent.exists():
+                target_path = candidate
+
+        step_files.append({
+            "path":    target_path,
+            "content": f["content"],
+        })
+
+    if not step_files:
+        return []
+
+    return [{
+        "desc":      f"Archivos extraídos de respuesta libre ({len(step_files)} archivo(s))",
+        "cmd":       None,
+        "files":     step_files,
+        "_is_serve": False,
+    }]
+
+
+# ═══════════════════════════════════════════════════════════════════
+#   PARSER — v12.1: normalize_newlines integrado en _parse_structured
 # ═══════════════════════════════════════════════════════════════════
 
 _CONTAMINATED_PLAN_MARKERS = (
@@ -792,11 +840,29 @@ def _response_is_contaminated(response: str) -> bool:
     txt = response or ""
     return any(m in txt for m in _CONTAMINATED_PLAN_MARKERS)
 
-def _parse_plan(response: str) -> list:
+def _parse_plan(response: str, project_dir: Path | None = None) -> list:
+    """
+    v12.1: Parsea el plan de la IA.
+    Ahora acepta project_dir para el fallback genérico de bloques ```.
+    """
     if _response_is_contaminated(response):
         return []
+
+    # ── Paso 1: Normalizar \\n literales en toda la respuesta ─────────────────
+    response = normalize_newlines(response)
+
     steps = _parse_structured(response)
-    if not steps: steps = _parse_natural(response)
+    if not steps:
+        steps = _parse_natural(response)
+
+    # ── Paso 2: Fallback genérico con extract_code_blocks ────────────────────
+    # Si el parseo estructurado y natural no encontraron pasos pero hay bloques ```
+    if not steps and '```' in response:
+        generic_steps = _extract_files_from_raw(response, project_dir)
+        if generic_steps:
+            P(f"  {C.YELLOW}  ⚠️  Formato libre detectado — usando extracción genérica de bloques{C.RESET}")
+            steps = generic_steps
+
     BLOCK = ("npm install -g",)
     result = []
     for step in steps:
@@ -810,8 +876,16 @@ def _parse_plan(response: str) -> list:
 def _parse_structured(response: str) -> list:
     """
     Parser estructurado PASO/CMD/FILE.
-    v11.6: aplica _strip_concat_lang a la primera línea de cada bloque FILE.
+
+    v12.1:
+      · normalize_newlines() aplicado a la respuesta completa antes de splitlines().
+      · Cada bloque de contenido FILE también es normalizado por si el modelo
+        escapó solo esa parte.
+      · _strip_concat_lang aplicado a la primera línea de cada bloque FILE.
     """
+    # Normalizar la respuesta completa antes de parsear
+    response = normalize_newlines(response)
+
     steps, lines, i = [], response.splitlines(), 0
     while i < len(lines):
         m = re.match(r'^PASO\s+\d+\s*[:\-]\s*(.+)', lines[i].strip(), re.IGNORECASE)
@@ -852,7 +926,12 @@ def _parse_structured(response: str) -> list:
                         first_content_line = False
                     cl.append(cur); i+=1
                 while cl and cl[-1].strip() == "": cl.pop()
-                if fpath and cl: step["files"].append({"path":fpath,"content":"\n".join(cl)})
+
+                if fpath and cl:
+                    # v12.1: normalizar el contenido del FILE también
+                    raw_content = "\n".join(cl)
+                    norm_content = normalize_newlines(raw_content)
+                    step["files"].append({"path": fpath, "content": norm_content})
                 continue
             i+=1
         if step["cmd"] or step["files"]: steps.append(step)
@@ -867,6 +946,9 @@ _LANG_DEF = {"html":"src/app/app.component.html","css":"src/app/app.component.cs
              "typescript":"src/app/app.component.ts","ts":"src/app/app.component.ts"}
 
 def _parse_natural(response: str) -> list:
+    # Normalizar antes de parsear
+    response = normalize_newlines(response)
+
     steps, lines, i = [], response.splitlines(), 0
     cur, last_path = None, ""
     def _flush():
@@ -896,7 +978,9 @@ def _parse_natural(response: str) -> list:
             while i < len(lines):
                 if lines[i].strip().startswith("```"): i+=1; break
                 cl.append(lines[i]); i+=1
-            content = "\n".join(cl).strip()
+            # v12.1: normalizar contenido del bloque
+            raw_content = "\n".join(cl).strip()
+            content = normalize_newlines(raw_content)
             if not content: continue
             fpath = last_path or _LANG_DEF.get(lang,"")
             if fpath:
@@ -969,7 +1053,7 @@ def _launch(workspace: Path, project_dir: Path,
             except KeyboardInterrupt: pass
 
 # ═══════════════════════════════════════════════════════════════════
-#   ORQUESTADOR PRINCIPAL — v12.0
+#   ORQUESTADOR PRINCIPAL — v12.1
 # ═══════════════════════════════════════════════════════════════════
 
 def run_orchestrator(objetivo: str, preferred_site: str=None) -> bool:
@@ -978,7 +1062,7 @@ def run_orchestrator(objetivo: str, preferred_site: str=None) -> bool:
     site_name = AI_SITES.get(preferred_site,{}).get("name","IA automática") if preferred_site else "IA automática"
 
     P(f"\n{C.CYAN}{C.BOLD}  ╔══════════════════════════════════════╗")
-    P(f"  ║   🤖 ORQUESTADOR SONNY  v12.0       ║")
+    P(f"  ║   🤖 ORQUESTADOR SONNY  v12.1       ║")
     P(f"  ╚══════════════════════════════════════╝{C.RESET}")
     P(f"  {C.DIM}Objetivo : {objetivo}{C.RESET}")
     P(f"  {C.DIM}Cerebro  : {site_name}{C.RESET}\n")
@@ -1029,6 +1113,20 @@ def run_orchestrator(objetivo: str, preferred_site: str=None) -> bool:
 
     # ── TURNO 2 ─────────────────────────────────────────────────────
     P(f"  {C.BOLD}{C.MAGENTA}━━━ TURNO 2 → {site_name}: comando ng new ━━━{C.RESET}\n")
+
+    def _extract_ng_new(resp: str) -> str:
+        """Extrae el comando ng new de la respuesta de la IA."""
+        resp = normalize_newlines(resp)
+        for line in resp.splitlines():
+            clean = line.strip().lstrip("`$> ").strip()
+            if _is_bare_lang_label(clean): continue
+            clean = _strip_concat_lang(clean)
+            if clean.lower().startswith("ng new"):
+                return clean
+        return ""
+
+    _FAILED_RESPONSES = {"no se pudo leer la respuesta", "no se pudo leer", ""}
+
     resp_create = _ask_web(_p2_steps_create(objetivo, verified_tools), preferred_site, objetivo)
     if not resp_create:
         P(f"  {C.RED}  ❌ Sin respuesta Turno 2.{C.RESET}")
@@ -1036,14 +1134,17 @@ def run_orchestrator(objetivo: str, preferred_site: str=None) -> bool:
     P(f"  {C.CYAN}  💬 Comando recibido:{C.RESET}")
     P(f"  {C.DIM}    {resp_create.strip()[:100]}{C.RESET}\n")
 
-    create_cmd = ""
-    for line in resp_create.splitlines():
-        clean = line.strip().lstrip("`$> ").strip()
-        if _is_bare_lang_label(clean): continue
-        clean = _strip_concat_lang(clean)
-        if clean.lower().startswith("ng new"):
-            create_cmd = clean
-            break
+    create_cmd = _extract_ng_new(resp_create)
+
+    # ── Reintento si la respuesta fue ilegible (timeout/threshold del browser) ──
+    # Esto ocurre cuando la respuesta fue muy corta (ej. "ng new mi-app", 14 chars)
+    # y el browser no la capturó a tiempo. Reintentamos UNA vez con el mismo prompt.
+    if not create_cmd and resp_create.strip().lower() in _FAILED_RESPONSES:
+        P(f"  {C.YELLOW}  ⚠️  Respuesta ilegible — reintentando Turno 2...{C.RESET}\n")
+        resp_create2 = _ask_web(_p2_steps_create(objetivo, verified_tools), preferred_site, objetivo)
+        if resp_create2 and resp_create2.strip().lower() not in _FAILED_RESPONSES:
+            P(f"  {C.DIM}    Reintento: {resp_create2.strip()[:100]}{C.RESET}\n")
+            create_cmd = _extract_ng_new(resp_create2)
 
     if not create_cmd:
         create_cmd = "ng new mi-app --style=css --skip-git --defaults"
@@ -1071,6 +1172,7 @@ def run_orchestrator(objetivo: str, preferred_site: str=None) -> bool:
             P(f"  {C.YELLOW}  Consultando {site_name} para corregir...{C.RESET}\n")
             fix_resp = _ask_web(_p_fix_ng_new(objetivo, create_cmd, err, verified_tools), preferred_site, objetivo)
             if fix_resp:
+                fix_resp = normalize_newlines(fix_resp)
                 for line in fix_resp.splitlines():
                     clean = line.strip().lstrip("`$> ").strip()
                     if _is_bare_lang_label(clean): continue
@@ -1114,7 +1216,7 @@ def run_orchestrator(objetivo: str, preferred_site: str=None) -> bool:
         P(f"  {C.DIM}    {l.strip()[:100]}{C.RESET}")
     P(f"  {C.DIM}    ...{C.RESET}\n")
 
-    steps = _parse_plan(resp_steps)
+    steps = _parse_plan(resp_steps, project_dir)
     if not steps:
         P(f"  {C.YELLOW}  ⚠️  No se encontraron pasos ejecutables.{C.RESET}")
         log_error(site_name, f"No steps parsed: {resp_steps[:300]}")
@@ -1157,7 +1259,7 @@ def run_orchestrator(objetivo: str, preferred_site: str=None) -> bool:
                 if not fix_resp:
                     P(f"  {C.RED}  ❌ Sin respuesta de la IA. Reintentando...{C.RESET}")
                     continue
-                fix_steps = [s for s in _parse_plan(fix_resp) if not s.get("_is_serve")]
+                fix_steps = [s for s in _parse_plan(fix_resp, project_dir) if not s.get("_is_serve")]
                 if not fix_steps:
                     P(f"  {C.YELLOW}  ⚠️  Sin pasos. Reintentando con formato explícito...{C.RESET}")
                     fix_resp2 = _ask_web(
@@ -1165,7 +1267,7 @@ def run_orchestrator(objetivo: str, preferred_site: str=None) -> bool:
                         preferred_site, objetivo
                     )
                     if fix_resp2:
-                        fix_steps = [s for s in _parse_plan(fix_resp2) if not s.get("_is_serve")]
+                        fix_steps = [s for s in _parse_plan(fix_resp2, project_dir) if not s.get("_is_serve")]
                     if not fix_steps:
                         P(f"  {C.YELLOW}  ⚠️  Aún sin pasos ejecutables. Saltando...{C.RESET}")
                         break
@@ -1225,7 +1327,7 @@ def run_orchestrator_with_site(objetivo: str) -> bool:
     return run_orchestrator(objetivo, preferred_site=site)
 
 # ═══════════════════════════════════════════════════════════════════
-#   SERVE + FIX LOOP — v12.0: SIN LÍMITE DE INTENTOS
+#   SERVE + FIX LOOP — v12.1: SIN LÍMITE DE INTENTOS + parser genérico
 # ═══════════════════════════════════════════════════════════════════
 
 def _extract_build_errors(output: str) -> str:
@@ -1257,8 +1359,8 @@ def _has_build_errors(output: str) -> bool:
 def _serve_and_fix(project_dir: Path, objetivo: str, preferred_site: str,
                    verified_tools: dict, ng_major: int=17):
     """
-    v12.0: Loop de compilación y corrección SIN LÍMITE DE INTENTOS.
-    Usa Ctrl+C para detener si no quiere seguir intentando.
+    v12.1: Loop de compilación y corrección SIN LÍMITE DE INTENTOS.
+    Integra normalize_newlines y _parse_plan con project_dir para fallback genérico.
     """
     tools_str = ", ".join(f"{n} {i['version']}" for n,i in verified_tools.items() if i["ok"])
     site_name = AI_SITES.get(preferred_site,{}).get("name","IA") if preferred_site else "IA"
@@ -1334,7 +1436,8 @@ def _serve_and_fix(project_dir: Path, objetivo: str, preferred_site: str,
                 P(f"  {C.DIM}    {l.strip()[:100]}{C.RESET}")
             P(f"  {C.DIM}    ...{C.RESET}\n")
 
-            fix_steps = [s for s in _parse_plan(fix_resp) if not s.get("_is_serve")]
+            # v12.1: pasar project_dir al parser para el fallback genérico
+            fix_steps = [s for s in _parse_plan(fix_resp, project_dir) if not s.get("_is_serve")]
 
             if not fix_steps:
                 P(f"  {C.YELLOW}  ⚠️  No se encontraron pasos — reintentando con formato explícito...{C.RESET}")
@@ -1347,7 +1450,7 @@ def _serve_and_fix(project_dir: Path, objetivo: str, preferred_site: str,
                     for l in fix_resp2.strip().splitlines()[:6]:
                         P(f"  {C.DIM}    {l.strip()[:100]}{C.RESET}")
                     P(f"  {C.DIM}    ...{C.RESET}\n")
-                    fix_steps = [s for s in _parse_plan(fix_resp2) if not s.get("_is_serve")]
+                    fix_steps = [s for s in _parse_plan(fix_resp2, project_dir) if not s.get("_is_serve")]
 
             if not fix_steps:
                 P(f"  {C.YELLOW}  ⚠️  Sin pasos ejecutables tras 2 intentos. Reintentando compilación...{C.RESET}")

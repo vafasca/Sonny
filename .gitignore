@@ -43,4 +43,5 @@ workspace/
 exportModifiedFiles.js
 cambios
 perfil_edge/
-logs/
+logs
+sessions.jsonl

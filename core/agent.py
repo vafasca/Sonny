@@ -2,12 +2,25 @@
 core/agent.py — Agente autónomo de Sonny.
 Recibe un objetivo, escribe código, lo ejecuta, lee errores y corrige solo.
 Soporta: Python, JavaScript/Node, HTML+CSS, y más.
+
+CAMBIOS v2:
+  · Integración con core/code_parser.py para normalización de saltos de línea.
+  · normalize_newlines() aplicado al campo 'content' del JSON antes de escribir.
+  · extract_code_blocks() usado como fallback cuando el modelo devuelve código
+    dentro del JSON con \\n literales (problema frecuente en ChatGPT).
+  · _fix_json_content() repara el dict de acción completo antes de procesarlo.
 """
 import json, os, subprocess, sys, tempfile, re, shutil
 from pathlib import Path
 from datetime import datetime
-from config   import PROVIDERS
-from core.ai  import _call_openai, _call_gemini, _describe_error
+from config        import PROVIDERS
+from core.ai       import _call_openai, _call_gemini, _describe_error
+from core.code_parser import (
+    normalize_newlines,
+    fix_content_newlines,
+    extract_code_blocks,
+    blocks_to_files,
+)
 
 # ── Configuración ──────────────────────────────────────────────────────────────
 MAX_ITERATIONS  = 8       # máximo de intentos antes de rendirse
@@ -94,10 +107,87 @@ def es_tarea_agente(texto: str) -> bool:
     low = texto.lower()
     return any(t in low for t in TRIGGERS_AGENTE)
 
+# ── Reparación del JSON de la IA ───────────────────────────────────────────────
+
+def _fix_action_content(accion: dict) -> dict:
+    """
+    Repara el campo 'content' de una acción write_file / fix_file.
+
+    PROBLEMA: ChatGPT serializa el contenido del archivo con \\n literales
+    en lugar de saltos de línea reales, dejando todo el código en una sola línea.
+
+    SOLUCIÓN (en orden de prioridad):
+      1. Si el content tiene \\n literales → normalize_newlines()
+      2. Si el content tiene bloques ```lang``` embebidos → extraer con regex
+      3. Si no hay content pero sí bloques en el mensaje raw → extraer
+    """
+    if not accion:
+        return accion
+
+    content = accion.get("content", "")
+    if not content:
+        return accion
+
+    # ── Paso 1: normalizar \\n literales ──────────────────────────────────────
+    fixed = normalize_newlines(content)
+
+    # ── Paso 2: si el content contiene bloques ``` → extraer el primero ──────
+    # (ChatGPT a veces mete el código dentro de un bloque markdown dentro del JSON)
+    if '```' in fixed:
+        blocks = extract_code_blocks(fixed)
+        if blocks:
+            # Usar el contenido del primer bloque (ya normalizado dentro del parser)
+            accion["content"] = fix_content_newlines(blocks[0]["content"])
+            # Si el bloque tiene lenguaje y no se especificó en la acción → rellenar
+            if blocks[0]["lang"] and not accion.get("lang"):
+                accion["lang"] = blocks[0]["lang"]
+            return accion
+
+    # ── Paso 3: aplicar fix_content_newlines al texto normalizado ─────────────
+    accion["content"] = fix_content_newlines(fixed)
+    return accion
+
+
+def _fix_multifile_response(raw_text: str, base_name: str = "output") -> list[dict] | None:
+    """
+    Intenta extraer múltiples archivos de una respuesta que NO siguió el formato JSON.
+
+    Usado como fallback cuando la IA devuelve markdown con ``` bloques
+    en vez de JSON válido.
+
+    Returns:
+        Lista de acciones write_file simuladas, o None si no hay bloques.
+    """
+    blocks = extract_code_blocks(raw_text)
+    if not blocks:
+        return None
+
+    files = blocks_to_files(blocks, base_name)
+    if not files:
+        return None
+
+    acciones = []
+    for f in files:
+        acciones.append({
+            "action":  "write_file",
+            "path":    f["path"],
+            "content": f["content"],
+            "lang":    f["lang"],
+        })
+
+    return acciones
+
 # ── Llamada a IA con historial ─────────────────────────────────────────────────
 
-def _call_agent_ai(messages: list[dict]) -> dict | None:
-    """Llama al mejor proveedor disponible con historial de conversación."""
+def _call_agent_ai(messages: list[dict]) -> dict | list | None:
+    """
+    Llama al mejor proveedor disponible con historial de conversación.
+
+    Returns:
+        · dict  → acción individual JSON (comportamiento normal)
+        · list  → múltiples acciones write_file extraídas de bloques markdown
+        · None  → sin respuesta
+    """
     for p in PROVIDERS:
         key = p.get("api_key", "")
         if not key or "XXXX" in key:
@@ -128,13 +218,38 @@ def _call_agent_ai(messages: list[dict]) -> dict | None:
                 r.raise_for_status()
                 raw = r.json()["choices"][0]["message"]["content"].strip()
 
-            # Limpiar y parsear JSON
-            clean = raw.replace("```json","").replace("```","").strip()
-            # Extraer primer objeto JSON si hay texto extra
+            # ── Normalizar la respuesta RAW antes de parsear ─────────────────
+            # ChatGPT puede devolver el JSON entero con \\n literales
+            raw_normalized = normalize_newlines(raw)
+
+            # ── Limpiar markdown y extraer JSON ───────────────────────────────
+            clean = raw_normalized.replace("```json","").replace("```","").strip()
+
+            # Intentar parsear como JSON
             match = re.search(r'\{.*\}', clean, re.DOTALL)
             if match:
-                return json.loads(match.group())
+                accion = json.loads(match.group())
+                # Reparar el campo content si tiene \\n literales
+                accion = _fix_action_content(accion)
+                return accion
+
+            # Si no hay JSON válido pero hay bloques ```, intentar extracción directa
+            fallback = _fix_multifile_response(raw_normalized)
+            if fallback:
+                print(f"  {C.YELLOW}⚠️  Respuesta sin JSON — extrayendo {len(fallback)} bloque(s) de código{C.RESET}")
+                return fallback
+
             return json.loads(clean)
+
+        except json.JSONDecodeError:
+            # Último intento: extraer bloques aunque el JSON falle completamente
+            raw_text = locals().get("raw", "") or ""
+            if raw_text:
+                fallback = _fix_multifile_response(normalize_newlines(raw_text))
+                if fallback:
+                    print(f"  {C.YELLOW}⚠️  JSON inválido — usando extracción de bloques{C.RESET}")
+                    return fallback
+            print(f"{C.DIM}  [{p['name']}] JSON inválido en la respuesta{C.RESET}")
 
         except Exception as e:
             print(f"{C.DIM}  {_describe_error(e, p['name'])}{C.RESET}")
@@ -200,7 +315,6 @@ def _demo_visual(workspace: Path, archivos: list[str], _opened: list = []):
     - HTML → navegador automáticamente
     - Python/JS → pregunta si quiere terminal
     """
-    # Bandera: si ya abrimos algo en esta sesión de tarea, salir
     if _opened:
         return
     if not archivos:
@@ -217,7 +331,6 @@ def _demo_visual(workspace: Path, archivos: list[str], _opened: list = []):
             break
 
     if not main_file:
-        # Buscar directamente en workspace por si la lista está incompleta
         for ext in (".html", ".py", ".js"):
             found = list(workspace.glob(f"*{ext}"))
             if found:
@@ -238,7 +351,7 @@ def _demo_visual(workspace: Path, archivos: list[str], _opened: list = []):
             print(f"  {C.CYAN}{'─'*44}{C.RESET}")
             print(f"  {C.GREEN}🌐 Abriendo en el navegador...{C.RESET}\n")
             os.startfile(str(full_path))
-            _opened.append(True)   # marcar como abierto
+            _opened.append(True)
 
         elif ext in (".py", ".js"):
             print(f"\n  {C.CYAN}{'─'*44}{C.RESET}")
@@ -256,7 +369,223 @@ def _demo_visual(workspace: Path, archivos: list[str], _opened: list = []):
         print(f"  {C.RED}No pude abrir la demo: {e}{C.RESET}\n")
 
 
+# ── Helpers de escritura de archivos ──────────────────────────────────────────
+
+def _write_file_action(accion: dict, workspace: Path) -> str | None:
+    """
+    Procesa una acción write_file o fix_file:
+      1. Extrae path y content del dict.
+      2. Aplica normalización de newlines.
+      3. Si el content tiene bloques ```, los extrae con el parser genérico.
+      4. Escribe el archivo en el workspace.
+
+    Returns:
+        path del archivo escrito, o None si algo falla.
+    """
+    path    = accion.get("path", "output.py")
+    content = accion.get("content", "")
+    lang    = accion.get("lang", Path(path).suffix.lstrip(".") or "python")
+
+    if not content:
+        print(f"  {C.YELLOW}⚠️  content vacío para {path}{C.RESET}")
+        return None
+
+    # Normalizar el contenido (fix \\n literales + extraer de bloques si los hay)
+    accion = _fix_action_content(accion)
+    content = accion.get("content", content)
+
+    full_path = workspace / path
+    full_path.parent.mkdir(parents=True, exist_ok=True)
+    full_path.write_text(content, encoding="utf-8")
+    return path
+
+
 # ── Loop principal del agente ──────────────────────────────────────────────────
+
+def _process_single_action(accion: dict, workspace: Path,
+                            archivos_creados: list[str],
+                            messages: list[dict],
+                            last_run_output_ref: list) -> str | None:
+    """
+    Procesa una única acción devuelta por la IA.
+    Returns: "done", "ask", "impossible", "continue", "unknown" o None para continuar.
+    """
+    action_type = accion.get("action", "unknown")
+
+    # ── write_file / fix_file ─────────────────────────────────────────────────
+    if action_type in ("write_file", "fix_file"):
+        path    = accion.get("path", "output.py")
+        fixed   = accion.get("error_fixed", "")
+        lang    = accion.get("lang", Path(path).suffix.lstrip(".") or "python")
+
+        # Para Java: limpiar .java y .class previos si el archivo cambia
+        if Path(path).suffix.lower() == ".java":
+            for old_java in workspace.glob("*.java"):
+                if old_java.name != path:
+                    old_java.unlink(missing_ok=True)
+            for cls in workspace.glob("*.class"):
+                cls.unlink(missing_ok=True)
+
+        # Si crean un .js separado pero ya existe un .html → fusionar inline
+        if Path(path).suffix.lower() == ".js" and list(workspace.glob("*.html")):
+            html_files = list(workspace.glob("*.html"))
+            html_path  = html_files[0]
+            html_src   = html_path.read_text(encoding="utf-8")
+
+            # Normalizar el content del JS antes de fusionar
+            accion    = _fix_action_content(accion)
+            js_clean  = re.sub(r'</?script[^>]*>', '', accion.get("content","")).strip()
+            script_tag = f"\n<script>\n{js_clean}\n</script>\n"
+
+            if "</body>" in html_src:
+                merged = html_src.replace("</body>", script_tag + "</body>")
+            else:
+                merged = html_src + script_tag
+            html_path.write_text(merged, encoding="utf-8")
+
+            print(f"  {C.YELLOW}📎 JS fusionado en {html_path.name} (no se crea .js separado){C.RESET}")
+            messages.append({"role": "assistant", "content": json.dumps(accion)})
+            messages.append({"role": "user",
+                "content": "El JS fue fusionado directamente en el HTML. ¿La tarea está completa? Responde con action:done."
+            })
+            return "continue"
+
+        # Escribir el archivo con normalización de newlines
+        written_path = _write_file_action(accion, workspace)
+        if written_path is None:
+            return "continue"
+
+        if path not in archivos_creados:
+            archivos_creados.append(path)
+
+        if action_type == "fix_file":
+            print(f"  {C.YELLOW}🔧 Corrigiendo: {path}{C.RESET}")
+            if fixed:
+                print(f"  {C.DIM}   Error solucionado: {fixed}{C.RESET}")
+        else:
+            print(f"  {C.GREEN}📝 Archivo creado: {path} ({lang}){C.RESET}")
+
+        # Auto-ejecutar si es código ejecutable
+        ext_path = Path(path).suffix.lower()
+        has_html = any(workspace.glob("*.html"))
+
+        if ext_path in (".py", ".ts") or (ext_path == ".js" and not has_html):
+            cmd = _detect_runner(path)
+            print(f"  {C.DIM}   Ejecutando: {cmd}{C.RESET}")
+            ok, output = _run_command(cmd, workspace)
+            last_run_output_ref[0] = output
+            _print_output(ok, output)
+
+            status = "ÉXITO" if ok else "ERROR"
+            messages.append({"role": "assistant", "content": json.dumps(accion)})
+            messages.append({"role": "user",
+                "content": f"Resultado de ejecutar {path}:\n[{status}]\n{output}\n\n"
+                           + ("✅ Funciona. ¿Está la tarea completa? Si sí, responde con action:done."
+                              if ok else
+                              "❌ Hay errores. Analiza el error y corrige el código.")
+            })
+
+        elif ext_path == ".js" and has_html:
+            print(f"  {C.DIM}   JS de browser (se ejecuta en el navegador, no en Node){C.RESET}")
+            messages.append({"role": "assistant", "content": json.dumps(accion)})
+            messages.append({"role": "user",
+                "content": f"Archivo {path} creado. Es JS para browser. ¿Tarea completa? Responde con action:done."
+            })
+
+        elif ext_path == ".java":
+            class_name = Path(path).stem
+            compile_ok, compile_out = _run_command(f"javac {path}", workspace)
+            if compile_ok:
+                print(f"  {C.DIM}   Compilado ✅ → ejecutando {class_name}{C.RESET}")
+                ok, output = _run_command(f"java {class_name}", workspace)
+                last_run_output_ref[0] = output
+                _print_output(ok, output)
+                status = "ÉXITO" if ok else "ERROR"
+            else:
+                print(f"  {C.DIM}   Compilación fallida{C.RESET}")
+                output = compile_out
+                last_run_output_ref[0] = output
+                _print_output(False, output)
+                status = "ERROR DE COMPILACIÓN"
+
+            messages.append({"role": "assistant", "content": json.dumps(accion)})
+            messages.append({"role": "user",
+                "content": f"Resultado Java ({path}):\n[{status}]\n{output}\n\n"
+                           + ("✅ Funciona. ¿Tarea completa? Responde con action:done."
+                              if status == "ÉXITO" else
+                              "❌ Error. Analiza y corrige. El nombre del archivo DEBE ser igual al nombre de la clase.")
+            })
+
+        else:
+            is_html = ext_path == ".html"
+            messages.append({"role": "assistant", "content": json.dumps(accion)})
+            messages.append({"role": "user",
+                "content": (
+                    f"Archivo {path} creado. El HTML se abrirá en el navegador al finalizar. "
+                    f"Si el trabajo está completo, responde con action:done."
+                    if is_html else
+                    f"Archivo {path} creado. ¿Qué sigue?"
+                )
+            })
+
+        return "continue"
+
+    # ── run ────────────────────────────────────────────────────────────────────
+    elif action_type == "run":
+        cmd  = accion.get("cmd", "")
+        desc = accion.get("description", cmd)
+
+        cmd_low = cmd.lower().strip()
+        is_browser_open = (
+            any(cmd_low.startswith(x) for x in ("start ", "open ", "xdg-open "))
+            and any(ext in cmd_low for ext in (".html", ".htm"))
+        )
+        if is_browser_open:
+            print(f"  {C.DIM}   (apertura de HTML diferida al final){C.RESET}")
+            messages.append({"role": "assistant", "content": json.dumps(accion)})
+            messages.append({"role": "user",
+                "content": "El HTML se abrirá en el navegador al finalizar. ¿La tarea está completa? Responde con action:done."
+            })
+            return "continue"
+
+        print(f"  {C.CYAN}▶  {desc}{C.RESET}")
+        ok, output = _run_command(cmd, workspace)
+        last_run_output_ref[0] = output
+        _print_output(ok, output)
+
+        messages.append({"role": "assistant", "content": json.dumps(accion)})
+        messages.append({"role": "user",
+            "content": f"Resultado:\n[{'ÉXITO' if ok else 'ERROR'}]\n{output}\n\n"
+                       + ("¿Tarea completa? Responde con action:done si sí."
+                          if ok else
+                          "Hay errores. Corrígelos.")
+        })
+        return "continue"
+
+    # ── done ───────────────────────────────────────────────────────────────────
+    elif action_type == "done":
+        return "done"
+
+    # ── ask ────────────────────────────────────────────────────────────────────
+    elif action_type == "ask":
+        msg = accion.get("msg", "¿Puedes darme más detalles?")
+        print(f"\n  {C.YELLOW}🤖 {msg}{C.RESET}")
+        respuesta = input(f"  {C.CYAN}tú > {C.RESET}").strip()
+        messages.append({"role": "assistant", "content": json.dumps(accion)})
+        messages.append({"role": "user", "content": respuesta})
+        return "continue"
+
+    # ── impossible ─────────────────────────────────────────────────────────────
+    elif action_type == "impossible":
+        print(f"\n  {C.RED}⚠️  {accion.get('msg', 'No puedo completar esta tarea.')}{C.RESET}\n")
+        return "impossible"
+
+    else:
+        print(f"  {C.DIM}Acción desconocida: {action_type}. Reintentando...{C.RESET}")
+        messages.append({"role": "assistant", "content": json.dumps(accion)})
+        messages.append({"role": "user", "content": "No entendí esa acción. Por favor usa solo las acciones permitidas."})
+        return "continue"
+
 
 def run_agent(objetivo: str) -> bool:
     """
@@ -274,180 +603,60 @@ def run_agent(objetivo: str) -> bool:
     ]
 
     archivos_creados: list[str] = []
-    last_run_output: str = ""
-    last_action_hash: str = ""   # evita procesar la misma acción dos veces
+    last_run_output_ref = [""]   # mutable container para pasar por referencia
+    last_action_hash: str = ""
 
     for i in range(1, MAX_ITERATIONS + 1):
         print(f"{C.BLUE}{C.BOLD}  ── Paso {i} ──{C.RESET}")
         print(f"  {C.DIM}Consultando IA...{C.RESET}")
 
-        accion = _call_agent_ai(messages)
+        respuesta = _call_agent_ai(messages)
 
-        if accion is None:
+        if respuesta is None:
             print(f"{C.RED}  ❌ La IA no respondió. Sin proveedores disponibles.{C.RESET}")
             return False
+
+        # ── Manejar respuesta multi-archivo (lista de acciones) ────────────────
+        if isinstance(respuesta, list):
+            # El modelo devolvió bloques de código directamente → procesar cada uno
+            print(f"  {C.GREEN}📦 Respuesta multi-bloque: {len(respuesta)} archivo(s){C.RESET}")
+            all_done = True
+            for accion in respuesta:
+                resultado = _process_single_action(
+                    accion, workspace, archivos_creados,
+                    messages, last_run_output_ref
+                )
+                if resultado == "impossible":
+                    return False
+            # Después de procesar todos los archivos, preguntar a la IA si la tarea está lista
+            messages.append({
+                "role": "user",
+                "content": f"Se crearon {len(respuesta)} archivo(s): {[a.get('path') for a in respuesta]}. "
+                           f"¿La tarea está completa? Responde con action:done si sí, o continúa."
+            })
+            continue
+
+        # ── Respuesta normal (dict) ────────────────────────────────────────────
+        accion = respuesta
 
         # Detectar respuesta duplicada
         import hashlib
         action_hash = hashlib.md5(json.dumps(accion, sort_keys=True).encode()).hexdigest()
         if action_hash == last_action_hash:
             print(f"  {C.DIM}   (respuesta duplicada ignorada){C.RESET}")
-            # Pedir a la IA que avance
             messages.append({"role": "user", "content": "Continúa con el siguiente paso."})
             last_action_hash = ""
             continue
         last_action_hash = action_hash
 
-        action_type = accion.get("action", "unknown")
+        resultado = _process_single_action(
+            accion, workspace, archivos_creados,
+            messages, last_run_output_ref
+        )
 
-        # ── write_file ─────────────────────────────────────────────────────
-        if action_type in ("write_file", "fix_file"):
-            path    = accion.get("path", "output.py")
-            content = accion.get("content", "")
-            lang    = accion.get("lang", Path(path).suffix.lstrip(".") or "python")
-            fixed   = accion.get("error_fixed", "")
-
-            # Para Java: si la IA cambia el nombre del archivo, limpiar el viejo
-            if Path(path).suffix.lower() == ".java":
-                # Eliminar cualquier .java previo que ya no sea válido
-                for old_java in workspace.glob("*.java"):
-                    if old_java.name != path:
-                        old_java.unlink(missing_ok=True)
-                # Eliminar .class compilados anteriores (pueden causar conflictos)
-                for cls in workspace.glob("*.class"):
-                    cls.unlink(missing_ok=True)
-
-            # Si crean un .js separado pero ya existe un .html → fusionar inline
-            if Path(path).suffix.lower() == ".js" and list(workspace.glob("*.html")):
-                html_files = list(workspace.glob("*.html"))
-                html_path  = html_files[0]
-                html_src   = html_path.read_text(encoding="utf-8")
-                # Limpiar etiquetas <script> del contenido JS si las trae
-                js_clean = re.sub(r'</?script[^>]*>', '', content).strip()
-                script_tag = f"\n<script>\n{js_clean}\n</script>\n"
-                if "</body>" in html_src:
-                    merged = html_src.replace("</body>", script_tag + "</body>")
-                else:
-                    merged = html_src + script_tag
-                html_path.write_text(merged, encoding="utf-8")
-                print(f"  {C.YELLOW}📎 JS fusionado en {html_path.name} (no se crea .js separado){C.RESET}")
-                messages.append({"role": "assistant", "content": json.dumps(accion)})
-                messages.append({"role": "user",
-                    "content": f"El JS fue fusionado directamente en el HTML. No se creó archivo .js separado. ¿La tarea está completa? Responde con action:done."
-                })
-                continue
-
-            full_path = workspace / path
-            full_path.write_text(content, encoding="utf-8")
-            if path not in archivos_creados:
-                archivos_creados.append(path)
-
-            if action_type == "fix_file":
-                print(f"  {C.YELLOW}🔧 Corrigiendo: {path}{C.RESET}")
-                print(f"  {C.DIM}   Error solucionado: {fixed}{C.RESET}")
-            else:
-                print(f"  {C.GREEN}📝 Archivo creado: {path} ({lang}){C.RESET}")
-
-            # Auto-ejecutar si es código ejecutable
-            ext_path = Path(path).suffix.lower()
-            # Si hay HTML en el workspace, el JS es browser-only → no ejecutar con Node
-            has_html = any(workspace.glob("*.html"))
-            if ext_path in (".py", ".ts") or (ext_path == ".js" and not has_html):
-                cmd = _detect_runner(path)
-                print(f"  {C.DIM}   Ejecutando: {cmd}{C.RESET}")
-                ok, output = _run_command(cmd, workspace)
-                last_run_output = output
-                _print_output(ok, output)
-
-                # Alimentar resultado a la IA
-                status = "ÉXITO" if ok else "ERROR"
-                messages.append({"role": "assistant", "content": json.dumps(accion)})
-                messages.append({"role": "user",
-                    "content": f"Resultado de ejecutar {path}:\n[{status}]\n{output}\n\n"
-                               + ("✅ Funciona. ¿Está la tarea completa? Si sí, responde con action:done."
-                                  if ok else
-                                  "❌ Hay errores. Analiza el error y corrige el código.")
-                })
-            elif ext_path == ".js" and has_html:
-                # JS de browser incluido → solo confirmar
-                print(f"  {C.DIM}   JS de browser (se ejecuta en el navegador, no en Node){C.RESET}")
-                messages.append({"role": "assistant", "content": json.dumps(accion)})
-                messages.append({"role": "user",
-                    "content": f"Archivo {path} creado. Es JS para browser, se ejecutará junto al HTML. ¿Tarea completa? Responde con action:done."
-                })
-            elif ext_path == ".java":
-                # Java: compilar primero, luego ejecutar
-                class_name = Path(path).stem  # Suma.java → Suma
-                compile_ok, compile_out = _run_command(f"javac {path}", workspace)
-                if compile_ok:
-                    print(f"  {C.DIM}   Compilado ✅ → ejecutando {class_name}{C.RESET}")
-                    ok, output = _run_command(f"java {class_name}", workspace)
-                    last_run_output = output
-                    _print_output(ok, output)
-                    status = "ÉXITO" if ok else "ERROR"
-                else:
-                    print(f"  {C.DIM}   Compilación fallida{C.RESET}")
-                    output = compile_out
-                    last_run_output = output
-                    _print_output(False, output)
-                    status = "ERROR DE COMPILACIÓN"
-                messages.append({"role": "assistant", "content": json.dumps(accion)})
-                messages.append({"role": "user",
-                    "content": f"Resultado Java ({path}):\n[{status}]\n{output}\n\n"
-                               + ("✅ Funciona. ¿Tarea completa? Responde con action:done."
-                                  if status == "ÉXITO" else
-                                  "❌ Error. Analiza y corrige. Recuerda: el nombre del archivo DEBE ser igual al nombre de la clase pública con mayúscula exacta.")
-                })
-            else:
-                # HTML u otro archivo no ejecutable: notificar a la IA
-                is_html = ext_path == ".html"
-                messages.append({"role": "assistant", "content": json.dumps(accion)})
-                messages.append({"role": "user",
-                    "content": (
-                        f"Archivo {path} creado. El HTML se abrirá en el navegador al finalizar. "
-                        f"Si el trabajo está completo, responde con action:done."
-                        if is_html else
-                        f"Archivo {path} creado. ¿Qué sigue?"
-                    )
-                })
-
-        # ── run ────────────────────────────────────────────────────────────
-        elif action_type == "run":
-            cmd  = accion.get("cmd", "")
-            desc = accion.get("description", cmd)
-
-            # Si el comando intenta abrir un HTML en el navegador, ignorarlo.
-            # _demo_visual lo abrirá al final sin duplicar.
-            cmd_low = cmd.lower().strip()
-            is_browser_open = (
-                any(cmd_low.startswith(x) for x in ("start ", "open ", "xdg-open "))
-                and any(ext in cmd_low for ext in (".html", ".htm"))
-            )
-            if is_browser_open:
-                print(f"  {C.DIM}   (apertura de HTML diferida al final){C.RESET}")
-                messages.append({"role": "assistant", "content": json.dumps(accion)})
-                messages.append({"role": "user",
-                    "content": "El HTML se abrirá en el navegador al finalizar. ¿La tarea está completa? Responde con action:done."
-                })
-                continue
-
-            print(f"  {C.CYAN}▶  {desc}{C.RESET}")
-            ok, output = _run_command(cmd, workspace)
-            last_run_output = output
-            _print_output(ok, output)
-
-            messages.append({"role": "assistant", "content": json.dumps(accion)})
-            messages.append({"role": "user",
-                "content": f"Resultado:\n[{'ÉXITO' if ok else 'ERROR'}]\n{output}\n\n"
-                           + ("¿Tarea completa? Responde con action:done si sí."
-                              if ok else
-                              "Hay errores. Corrígelos.")
-            })
-
-        # ── done ───────────────────────────────────────────────────────────
-        elif action_type == "done":
-            msg    = accion.get("msg", "Tarea completada.")
-            files  = accion.get("files", archivos_creados)
+        if resultado == "done":
+            msg   = accion.get("msg", "Tarea completada.")
+            files = accion.get("files", archivos_creados)
             print(f"\n{C.GREEN}{C.BOLD}  ✅ TAREA COMPLETADA{C.RESET}")
             print(f"  {msg}")
             if files:
@@ -455,6 +664,7 @@ def run_agent(objetivo: str) -> bool:
                 for f in files:
                     fp = workspace / f
                     print(f"  {C.GREEN}  📄 {f}{C.RESET}{C.DIM} {'✅' if fp.exists() else '⚠️  no encontrado'}{C.RESET}")
+            last_run_output = last_run_output_ref[0]
             if last_run_output and last_run_output != "(sin output)":
                 print(f"\n  {C.CYAN}Último output:{C.RESET}")
                 for line in last_run_output.splitlines()[:10]:
@@ -463,23 +673,10 @@ def run_agent(objetivo: str) -> bool:
             _demo_visual(workspace, archivos_creados)
             return True
 
-        # ── ask ────────────────────────────────────────────────────────────
-        elif action_type == "ask":
-            msg = accion.get("msg", "¿Puedes darme más detalles?")
-            print(f"\n  {C.YELLOW}🤖 {msg}{C.RESET}")
-            respuesta = input(f"  {C.CYAN}tú > {C.RESET}").strip()
-            messages.append({"role": "assistant", "content": json.dumps(accion)})
-            messages.append({"role": "user", "content": respuesta})
-
-        # ── impossible ─────────────────────────────────────────────────────
-        elif action_type == "impossible":
-            print(f"\n  {C.RED}⚠️  {accion.get('msg', 'No puedo completar esta tarea.')}{C.RESET}\n")
+        elif resultado == "impossible":
             return False
 
-        else:
-            print(f"  {C.DIM}Acción desconocida: {action_type}. Reintentando...{C.RESET}")
-            messages.append({"role": "assistant", "content": json.dumps(accion)})
-            messages.append({"role": "user", "content": "No entendí esa acción. Por favor usa solo las acciones permitidas."})
+        # "continue" → siguiente iteración
 
     print(f"\n{C.RED}  ⚠️  Máximo de iteraciones alcanzado ({MAX_ITERATIONS}).{C.RESET}")
     print(f"  {C.DIM}Archivos guardados en: {workspace}{C.RESET}\n")
