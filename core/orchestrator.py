@@ -233,6 +233,26 @@ def _sanitize_content(content: str) -> str:
     # o atributos sueltos antes de código TS/HTML/CSS.
     cleaned = re.sub(r'^(?:\s*[a-zA-Z_:][-\w:.]*\s*=\s*"[^"]*"\s*)+(?=\S)', '', cleaned)
 
+    # Si un archivo TS/JS llegó en una sola línea (caso frecuente en respuestas web),
+    # forzamos un layout mínimo para evitar que comentarios `//` anulen el resto.
+    looks_ts_js = (
+        "\n" not in cleaned and
+        any(tok in cleaned for tok in ("import ", "export ", "class ", "@Component", "interface ")) and
+        cleaned.count(";") >= 3
+    )
+    if looks_ts_js:
+        fixed = cleaned
+        fixed = fixed.replace(";", ";\n")
+        fixed = fixed.replace("{", "{\n")
+        fixed = fixed.replace("}", "\n}\n")
+        fixed = re.sub(
+            r'(//[^\n]*?)(\s+)(?=(if\b|for\b|while\b|return\b|this\.|const\b|let\b|var\b|else\b|\}))',
+            r'\1\n',
+            fixed
+        )
+        fixed = re.sub(r'\n{3,}', '\n\n', fixed).strip()
+        cleaned = fixed
+
     return cleaned
 
 # ═══════════════════════════════════════════════════════════════════
