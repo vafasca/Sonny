@@ -777,6 +777,34 @@ def _p_fix_serve_force_format(objetivo: str, errors: str,
         f"Tarea original: {objetivo}"
     )
 
+def _p_fix_single_file_exact(objetivo: str, error_block: str,
+                             file_path: str, file_content: str,
+                             ng_major: int=17) -> str:
+    """
+    Prompt de corrección mínima para evitar reescrituras masivas.
+    Sigue formato ultra-específico solicitado por el usuario.
+    """
+    arch = _ng_arch_rules(ng_major)
+    return (
+        f"Corrige un error de compilación Angular v{ng_major}.\n"
+        f"TAREA ORIGINAL: {objetivo}\n\n"
+        f"{arch}\n"
+        f"Error exacto del compilador:\n\n"
+        f"```\n{error_block}\n```\n\n"
+        f"Archivo actual:\n\n"
+        f"FILE: {file_path}\n"
+        f"```\n{file_content}\n```\n\n"
+        f"Corrige únicamente lo necesario.\n"
+        f"No reescribas todo el proyecto.\n\n"
+        f"Responde SOLO en este formato:\n"
+        f"PASO 1: corrección mínima\n"
+        f"CMD: NINGUNO\n"
+        f"FILE: {file_path}\n"
+        f"```\n"
+        f"[contenido completo del archivo ya corregido]\n"
+        f"```"
+    )
+
 # ═══════════════════════════════════════════════════════════════════
 #   PARSER — v11.6: strip de etiquetas concatenadas en FILE content
 # ═══════════════════════════════════════════════════════════════════
@@ -1254,6 +1282,16 @@ def _has_build_errors(output: str) -> bool:
     if any(re.search(p, output) for p in patterns): return True
     return _has_functional_warnings(output)
 
+def _extract_primary_error_file(error_text: str) -> str:
+    """Extrae el primer archivo src/... mencionado en el error."""
+    if not error_text:
+        return ""
+    m = re.search(r'(src/[\w/\.\-]+\.\w{1,5})\s*:\s*\d+\s*:\s*\d+', error_text)
+    if m:
+        return m.group(1)
+    m = re.search(r'\b(src/[\w/\.\-]+\.\w{1,5})\b', error_text)
+    return m.group(1) if m else ""
+
 def _serve_and_fix(project_dir: Path, objetivo: str, preferred_site: str,
                    verified_tools: dict, ng_major: int=17):
     """
@@ -1315,7 +1353,22 @@ def _serve_and_fix(project_dir: Path, objetivo: str, preferred_site: str,
 
             P(f"\n  {C.MAGENTA}{C.BOLD}  🤖 Consultando {site_name}...{C.RESET}\n")
 
-            if use_strategy_change:
+            primary_file = _extract_primary_error_file(errors)
+            primary_file_content = ""
+            if primary_file:
+                fp = project_dir / primary_file
+                if fp.exists() and fp.is_file() and fp.stat().st_size <= 120_000:
+                    try:
+                        primary_file_content = fp.read_text(encoding="utf-8", errors="replace")
+                    except:
+                        primary_file_content = ""
+
+            if primary_file and primary_file_content:
+                P(f"  {C.BLUE}  🎯 Error localizado en archivo específico: {primary_file}{C.RESET}")
+                fix_prompt = _p_fix_single_file_exact(
+                    objetivo, errors, primary_file, primary_file_content, ng_major
+                )
+            elif use_strategy_change:
                 reason = f"códigos persistentes: {persistent_codes}" if persistent_codes else "estado sin cambios"
                 P(f"  {C.YELLOW}  ⚠️  {reason} → cambiando estrategia{C.RESET}")
                 fix_prompt = _p_fix_serve_strategy_change(
