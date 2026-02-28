@@ -146,6 +146,57 @@ Dame los pasos corregidos para solucionar este error.
 
 ---
 
+
+## Login persistente en ChatGPT
+
+- Sonny guarda cookies/sesión en `perfil_edge/<ia>` (ej: `perfil_edge/claude`, `perfil_edge/chatgpt`) usando Microsoft Edge (`msedge`).
+- Si inicias sesión una vez (manual o automático), debería persistir al cerrar/abrir Sonny.
+- Recomendado: haz login manual una sola vez por IA en Edge; la sesión quedará en su subcarpeta de `perfil_edge`.
+- Google puede bloquear logins automatizados cuando detecta navegador controlado por tests.
+- Login automático queda como opción avanzada, habilitándolo explícitamente:
+
+```bash
+export CHATGPT_AUTOMATED_LOGIN="1"
+export CHATGPT_EMAIL="tu_correo"
+export CHATGPT_PASSWORD="tu_password"
+python sonny.py
+```
+
+En Windows PowerShell:
+```powershell
+$env:CHATGPT_AUTOMATED_LOGIN="1"
+$env:CHATGPT_EMAIL="tu_correo"
+$env:CHATGPT_PASSWORD="tu_password"
+python sonny.py
+```
+
+> Si ves "No se ha podido iniciar sesión", desactiva autologin y completa login manual en Edge para persistir sesión.
+
+
+- Alternativa para usar tu Chrome real (perfil real):
+
+```bash
+# 1) Abrir Chrome tú mismo con depuración remota
+"C:/Program Files/Google/Chrome/Application/chrome.exe" --remote-debugging-port=9222
+
+# 2) Activar modo Chrome real en Sonny
+export SONNY_USE_SYSTEM_CHROME="1"
+export SONNY_CHROME_CDP_URL="http://127.0.0.1:9222"
+python sonny.py
+```
+
+En PowerShell:
+```powershell
+& "C:/Program Files/Google/Chrome/Application/chrome.exe" --remote-debugging-port=9222
+$env:SONNY_USE_SYSTEM_CHROME="1"
+$env:SONNY_CHROME_CDP_URL="http://127.0.0.1:9222"
+python sonny.py
+```
+
+> Así Sonny se conecta a una ventana real de Chrome y navega allí; si no puede conectar, cae a Edge persistente.
+
+---
+
 ## Archivos del proyecto
 
 ```
