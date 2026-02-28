@@ -513,6 +513,10 @@ class BrowserSession:
         stable        = 0
         no_text_count = 0
         new_appeared  = False
+        # ChatGPT a veces responde con bloques muy cortos (ej: "ng new ...").
+        # Si exigimos >40 chars, el loop se queda esperando aunque la respuesta
+        # ya esté visible en pantalla.
+        min_chars = 8 if self.site_key == "chatgpt" else 20
 
         await asyncio.sleep(3)
 
@@ -524,7 +528,7 @@ class BrowserSession:
             except Exception:
                 current = ""
 
-            if current and len(current) > 40:
+            if current and len(current.strip()) >= min_chars:
                 no_text_count = 0
                 if not new_appeared:
                     new_appeared = True
@@ -549,6 +553,13 @@ class BrowserSession:
                 else:
                     stable   = 0
                     last_txt = current
+            elif current and len(current.strip()) >= 4:
+                # Respuesta corta (frecuente en prompts de comando único).
+                # Si ya terminó de generar, la aceptamos sin esperar largos ciclos.
+                no_text_count = 0
+                if not await self._is_generating():
+                    print(f"  {C.DIM}  Respuesta corta detectada ({len(current)} chars){C.RESET}")
+                    return current.strip()
             else:
                 no_text_count += 1
                 if no_text_count == 8:
