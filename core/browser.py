@@ -445,6 +445,28 @@ class BrowserSession:
         except Exception:
             return ""
 
+    async def _extract_latest_response(self) -> str:
+        """
+        Devuelve la última respuesta visible del asistente, sin depender de prev_count.
+        Útil como fallback cuando el contador del DOM no sube por virtualización.
+        """
+        try:
+            txt = await self._page.evaluate(self.site["extract_js"], -1)
+            txt = (txt or "").strip()
+            if txt:
+                return txt
+        except Exception:
+            pass
+        try:
+            nodes = await self._page.query_selector_all(self.site["response_sel"])
+            if not nodes:
+                return ""
+            last = nodes[-1]
+            txt = await last.inner_text()
+            return (txt or "").strip()
+        except Exception:
+            return ""
+
     # ── Detección de generación activa ────────────────────────────────────────
 
     async def _is_generating(self) -> bool:
@@ -503,7 +525,8 @@ class BrowserSession:
     # ══════════════════════════════════════════════════════════════════════════
 
     async def _wait_for_response(self, max_wait: int = 0,
-                                  prev_count: int = 0) -> str:
+                                  prev_count: int = 0,
+                                  prev_latest: str = "") -> str:
         # Ajustar timeout por defecto según la IA
         if max_wait == 0:
             max_wait = 360 if self.site_key == "claude" else 180
@@ -513,6 +536,10 @@ class BrowserSession:
         stable        = 0
         no_text_count = 0
         new_appeared  = False
+        # ChatGPT a veces responde con bloques muy cortos (ej: "ng new ...").
+        # Si exigimos >40 chars, el loop se queda esperando aunque la respuesta
+        # ya esté visible en pantalla.
+        min_chars = 8 if self.site_key == "chatgpt" else 20
 
         await asyncio.sleep(3)
 
@@ -524,7 +551,7 @@ class BrowserSession:
             except Exception:
                 current = ""
 
-            if current and len(current) > 40:
+            if current and len(current.strip()) >= min_chars:
                 no_text_count = 0
                 if not new_appeared:
                     new_appeared = True
@@ -549,7 +576,23 @@ class BrowserSession:
                 else:
                     stable   = 0
                     last_txt = current
+            elif current and len(current.strip()) >= 4:
+                # Respuesta corta (frecuente en prompts de comando único).
+                # Si ya terminó de generar, la aceptamos sin esperar largos ciclos.
+                no_text_count = 0
+                if not await self._is_generating():
+                    print(f"  {C.DIM}  Respuesta corta detectada ({len(current)} chars){C.RESET}")
+                    return current.strip()
             else:
+                # Fallback para proveedores con virtualización del DOM (ChatGPT).
+                # Si no aparece "nuevo bloque" por count, igual intentamos detectar
+                # si cambió el último mensaje respecto al turno anterior.
+                if self.site_key == "chatgpt":
+                    latest = await self._extract_latest_response()
+                    if latest and latest != prev_latest and len(latest.strip()) >= 4:
+                        if not await self._is_generating():
+                            print(f"  {C.DIM}  Respuesta detectada por fallback ({len(latest)} chars){C.RESET}")
+                            return latest
                 no_text_count += 1
                 if no_text_count == 8:
                     print(f"  {C.YELLOW}  ⚠️  Aún esperando nueva respuesta...{C.RESET}")
@@ -596,6 +639,13 @@ class BrowserSession:
             else:
                 print(f"  {C.YELLOW}  ⚠️  Timeout — devolviendo ({len(txt)} chars){C.RESET}")
             return txt
+
+        # Último intento de rescate antes de devolver el mensaje de error.
+        if self.site_key == "chatgpt":
+            latest = await self._extract_latest_response()
+            if latest and latest != prev_latest:
+                print(f"  {C.YELLOW}  ⚠️  Timeout, usando fallback final ({len(latest)} chars){C.RESET}")
+                return latest
 
         return "No se pudo leer la respuesta."
 
@@ -674,8 +724,9 @@ class BrowserSession:
             else:
                 print(f"  {C.RED}Error encontrando input: {e}{C.RESET}"); raise
 
-        # ── Contar respuestas previas ANTES de enviar ────────────────────────
+        # ── Línea base ANTES de enviar ───────────────────────────────────────
         prev_count = await self._count_responses()
+        prev_latest = await self._extract_latest_response()
         print(f"    Respuestas previas en DOM: {prev_count}")
 
         # ── Copiar prompt al portapapeles y pegarlo ──────────────────────────
@@ -710,7 +761,7 @@ class BrowserSession:
 
         # ── Esperar respuesta ────────────────────────────────────────────────
         print(f"    Esperando respuesta de {site['name']}...")
-        return await self._wait_for_response(prev_count=prev_count)
+        return await self._wait_for_response(prev_count=prev_count, prev_latest=prev_latest)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
