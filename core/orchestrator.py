@@ -1,21 +1,46 @@
 """
-core/orchestrator.py  v11.4 — Orquestador Sonny
+core/orchestrator.py  v12.0 — Orquestador Sonny
 
-BUG-FIXES CRÍTICOS (confirmados en log de prueba):
-  - "Código"/"código" como etiqueta de lenguaje → TS2304 en TODOS los archivos
-    FIX: añadido a _BARE_LANG_LABELS + segunda pasada en _sanitize_content
-  - Angular 17+ standalone: ChatGPT crea app.module.ts → conflicto NG1010
-    FIX: _autofix_angular_standalone() lo elimina + reglas de arquitectura en prompts
-  - ngModel sin FormsModule → NG8002 persistente
-    FIX: FormsModule auto-añadido a componentes standalone con ngModel
-  - Anti-loop inefectivo (hash cambia pero mismos error codes)
-    FIX v2: rastrea set de error codes entre rondas; si persisten → estrategia diferente
+NUEVO en v12.0 — FIX LOOP SIN LÍMITE + FORMATO FORZADO:
+  PROBLEMA: Cuando la IA respondía sin formato PASO/CMD/FILE (ej: texto libre
+  como "Diagnosticando..."), fix_steps quedaba vacío y se hacía break,
+  abandonando el intento de corrección sin siquiera ejecutar nada.
 
-FASE 2 — nuevas mejoras:
-  7 → Contexto mejorado: app.config.ts/main.ts/app.routes.ts completos en Turno 3
-  8 → Validación semántica heurística tras build exitoso (no bloqueante)
-  9 → JSONL logging: log_build_error, log_fix_applied, log_autofix, log_session_end
- 11 → Validación de dependencias antes de ejecutar pasos
+  SOLUCIÓN:
+  1. Loop infinito (sin max_fix_rounds) — Ctrl+C para detener
+  2. Cuando fix_steps está vacío → reintentar con prompt ultra-explícito
+     (_p_fix_serve_force_format) que exige formato PASO/CMD/FILE estricto
+  3. Mostrar cada error al usuario con bloque visual claro
+  4. Mostrar correcciones en el mismo formato PASO X/N que los pasos normales
+  5. Anti-bucle: si mismos errores 3 rondas seguidas sin cambios → cambio de estrategia
+
+v11.6 — FIX _strip_concat_lang PARA CHATGPT EN ESPAÑOL:
+  PROBLEMA: ChatGPT responde en español con "Código:host {" (sin espacio entre
+  la etiqueta y el código). La versión anterior hacía `continue` cuando
+  rest[0] == ':' — correcto para evitar stripear "python:" solo, pero incorrecto
+  para "Código:host {" donde ':' es el separador real antes del código.
+  SOLUCIÓN: Si rest[0] == ':' y hay contenido real después → stripear label + ':'
+  Ahora "Código:host {" → ":host {" y "código:host {" → ":host {".
+  Claude no se ve afectado: usa etiquetas en inglés ("typescript", "bash") sin ':'.
+
+v11.5 — FIX ETIQUETAS DE LENGUAJE CONCATENADAS:
+  PROBLEMA: Claude.ai renderiza los bloques de código con la etiqueta de
+  lenguaje pegada al código en el innerText del DOM:
+    'bashng new ...'  en vez de  'bash\nng new ...'
+    'typescriptimport ...'  en vez de  'import ...'
+    'htmlimport ...'  en vez de  '<div ...'
+    'csshtml {...}'  en vez de  '.html {...}'
+  
+  FIX: Nueva función _strip_concat_lang(line) que detecta y elimina
+  etiquetas de lenguaje concatenadas al inicio de cada línea.
+
+v11.4 — BUG-FIXES anteriores (mantenidos):
+  - Angular 17+ standalone
+  - Anti-loop v2 con error codes
+  - Contexto mejorado en Turno 3
+  - Validación semántica heurística
+  - JSONL logging
+  - Validación de dependencias
 """
 
 import os, subprocess, re, shutil, json, hashlib
@@ -30,9 +55,9 @@ from core.web_log    import (
 )
 
 class C:
-    CYAN="[96m"; GREEN="[92m"; YELLOW="[93m"; RED="[91m"
-    BOLD="[1m";  DIM="[2m";    RESET="[0m";   MAGENTA="[95m"
-    BLUE="[94m"
+    CYAN="\033[96m"; GREEN="\033[92m"; YELLOW="\033[93m"; RED="\033[91m"
+    BOLD="\033[1m";  DIM="\033[2m";    RESET="\033[0m";   MAGENTA="\033[95m"
+    BLUE="\033[94m"
 
 WORKSPACE_ROOT      = Path(__file__).parent.parent / "workspace"
 MAX_FIX_ATTEMPTS    = 3
@@ -54,9 +79,9 @@ BROWSER_PATHS = {
 }
 
 # ═══════════════════════════════════════════════════════════════════
-#   BUG FIX #1: "Código"/"codigo" añadidos a etiquetas de lenguaje
-#   ChatGPT en español escribe "Código\nimport..." sin backticks
+#   ETIQUETAS DE LENGUAJE — FIX CONCATENACIÓN v11.6
 # ═══════════════════════════════════════════════════════════════════
+
 _BARE_LANG_LABELS = {
     # Inglés
     "typescript","javascript","python","html","css","scss","sass",
@@ -64,12 +89,75 @@ _BARE_LANG_LABELS = {
     "go","rust","ruby","php","ts","js","py","sh","jsx","tsx",
     "text","plaintext","plain","output","console","csharp","c#",
     "c++","cpp","dockerfile","makefile","angular","vue","react",
-    # Español — ChatGPT en español usa estas etiquetas sueltas
+    # Español
     "código","codigo",
-    # Con dos puntos (ej: "Código:\n...")
+    # Con dos puntos
     "código:","codigo:","typescript:","javascript:","html:","css:",
     "python:","bash:","json:",
 }
+
+_LANG_LABELS_SORTED = sorted(
+    {lab.rstrip(':') for lab in _BARE_LANG_LABELS},
+    key=len, reverse=True
+)
+
+def _is_bare_lang_label(line: str) -> bool:
+    """True si la línea completa es solo una etiqueta de lenguaje."""
+    stripped = line.strip().lower().rstrip(":")
+    return stripped in _BARE_LANG_LABELS or line.strip().lower() in _BARE_LANG_LABELS
+
+
+def _strip_concat_lang(line: str) -> str:
+    """
+    v11.6: Elimina etiquetas de lenguaje CONCATENADAS al inicio de la línea.
+
+    Casos que maneja:
+      "bashng new ..."        → "ng new ..."         (Claude, sin separador)
+      "typescriptimport ..."  → "import ..."         (Claude, sin separador)
+      "Código:host {"         → ":host {"  → ":host {" (ChatGPT ES, sep ':')
+      "código:host {"         → ":host {"             (ChatGPT ES, sep ':')
+
+    Lógica de separadores:
+      · Sin separador (rest[0] es código directo) → stripear label
+      · Separador ':' con contenido real después   → stripear label + ':'
+        (ChatGPT en español pone "Código:" antes del código)
+      · Separador ' ' o '\\t' → la etiqueta estaba sola en su línea pero
+        innerText las unió con espacio → devolver el resto desde el primer
+        carácter no-espacio
+
+    NOTA: Claude usa etiquetas en inglés sin ':' (typescript, bash, html),
+    por lo que este cambio no altera su comportamiento.
+    """
+    stripped = line.strip()
+    low      = stripped.lower()
+
+    for label in _LANG_LABELS_SORTED:
+        if low.startswith(label) and len(stripped) > len(label):
+            rest = stripped[len(label):]
+
+            # Separador espacio/tab → etiqueta estaba en línea propia,
+            # innerText las juntó; devolver el resto sin espacios iniciales.
+            if rest and rest[0] in (' ', '\t'):
+                remainder = rest.lstrip()
+                if remainder:
+                    return remainder
+                continue
+
+            # Separador ':' → ChatGPT ES pone "Código:" antes del código.
+            # Si hay contenido real después del ':', stripear label + ':'.
+            if rest and rest[0] == ':' and len(rest) > 1:
+                return rest[1:].lstrip()
+
+            # Sin separador → label pegada directamente al código (Claude).
+            if rest:
+                return rest
+
+    return line
+
+
+def _functional_warnings_check(output: str) -> bool:
+    return any(w in output for w in _FUNCTIONAL_WARNINGS)
+
 
 _FUNCTIONAL_WARNINGS = {
     "NG8001","NG8002","NG0303",
@@ -86,7 +174,6 @@ def _has_functional_warnings(output: str) -> bool:
     return any(w in output for w in _FUNCTIONAL_WARNINGS)
 
 def _extract_error_codes(output: str) -> set:
-    """Extrae códigos de error TypeScript/Angular (TS2304, NG1010, etc.)"""
     return set(re.findall(r'(?:TS|NG)\d{4}', output))
 
 def detectar_navegadores() -> list:
@@ -99,8 +186,9 @@ def P(text: str = "", end: str = "\n"):
     print(text, end=end, flush=True)
 
 # ═══════════════════════════════════════════════════════════════════
-#   SANITIZACIÓN — BUG FIX #1 integrado
+#   SANITIZACIÓN — v11.6 con strip de etiquetas concatenadas
 # ═══════════════════════════════════════════════════════════════════
+
 _CONTENT_PREFIXES = {
     "aquí tienes","aquí está","aqui tienes","aqui esta",
     "here's the","here is the","here's","here is",
@@ -108,38 +196,42 @@ _CONTENT_PREFIXES = {
     "el archivo","the file","contenido:","content:",
 }
 
-def _is_bare_lang_label(line: str) -> bool:
-    stripped = line.strip().lower().rstrip(":")
-    return stripped in _BARE_LANG_LABELS or line.strip().lower() in _BARE_LANG_LABELS
-
 def _sanitize_content(content: str) -> str:
+    """
+    Limpia el contenido de archivos antes de escribirlos al disco.
+    v11.6: También stripea etiquetas concatenadas (bashng, typescriptimport,
+           Código:host, etc.)
+    """
     if not content:
         return content
     lines = content.splitlines()
-    # 1. Bloque de backticks
+
     if lines and lines[0].strip().startswith("```"):
         lines = lines[1:]
     if lines and lines[-1].strip() == "```":
         lines = lines[:-1]
-    # 2. Etiqueta de lenguaje (primera pasada — puede ser "TypeScript", "Código", etc.)
     if lines and _is_bare_lang_label(lines[0]):
         lines = lines[1:]
-    # 3. Segunda pasada (a veces hay dos etiquetas seguidas)
     if lines and _is_bare_lang_label(lines[0]):
         lines = lines[1:]
-    # 4. Frase introductoria de la IA
+    if lines:
+        fixed = _strip_concat_lang(lines[0])
+        if fixed != lines[0].strip():
+            lines[0] = fixed
     if lines:
         first_clean = lines[0].strip().lower().rstrip(":")
         if any(first_clean.startswith(p) for p in _CONTENT_PREFIXES):
             lines = lines[1:]
-    # 5. Limpiar vacíos inicio/final
+
     while lines and not lines[0].strip(): lines = lines[1:]
     while lines and not lines[-1].strip(): lines = lines[:-1]
+
     return "\n".join(lines)
 
 # ═══════════════════════════════════════════════════════════════════
 #   DETECCIÓN DE VERSIÓN ANGULAR
 # ═══════════════════════════════════════════════════════════════════
+
 def _get_ng_major(project_dir: Path) -> int:
     pkg_path = project_dir / "package.json"
     if pkg_path.exists():
@@ -162,6 +254,7 @@ def _get_ng_major(project_dir: Path) -> int:
 # ═══════════════════════════════════════════════════════════════════
 #   HASH DE ARCHIVOS
 # ═══════════════════════════════════════════════════════════════════
+
 def _get_files_hash(project_dir: Path) -> str:
     hasher = hashlib.md5()
     skip = {"node_modules",".angular","dist","__pycache__"}
@@ -175,8 +268,9 @@ def _get_files_hash(project_dir: Path) -> str:
     return hasher.hexdigest()
 
 # ═══════════════════════════════════════════════════════════════════
-#   FASE 2 — Mejora 7: CONTEXTO DE ARCHIVOS CLAVE
+#   CONTEXTO DE ARCHIVOS CLAVE (Mejora 7)
 # ═══════════════════════════════════════════════════════════════════
+
 _KEY_CONFIGS_MODERN = [
     "src/app/app.config.ts","src/main.ts","src/app/app.routes.ts","angular.json"
 ]
@@ -203,15 +297,16 @@ def _get_key_context_files(project_dir: Path, ng_major: int) -> dict:
     return result
 
 # ═══════════════════════════════════════════════════════════════════
-#   FASE 2 — Mejora 8: VALIDACIÓN SEMÁNTICA
+#   VALIDACIÓN SEMÁNTICA (Mejora 8)
 # ═══════════════════════════════════════════════════════════════════
+
 _SEMANTIC_MAP = [
     (r'\brojo\b',       ["red","rojo","#f","danger","#e"]),
     (r'\bazul\b',       ["blue","azul","#0","primary","#2","#3"]),
     (r'\bverde\b',      ["green","verde","success","#4","#2a"]),
     (r'\blogin\b',      ["login","LoginComponent","sign-in","auth"]),
     (r'\btabla\b',      ["<table","mat-table","ngFor","@for","table"]),
-    (r'\bcalcul',        ["calculate","calc","result","compute"]),
+    (r'\bcalcul',       ["calculate","calc","result","compute"]),
     (r'\bformulario\b', ["<form","FormGroup","FormControl","NgForm"]),
     (r'\bdashboard\b',  ["dashboard","DashboardComponent","panel"]),
     (r'\bgráfica|grafica\b', ["chart","Chart","graph","canvas","recharts","d3"]),
@@ -239,8 +334,9 @@ def _semantic_validation_warning(objetivo: str, project_dir: Path):
         P(f"  {C.DIM}    (puede ser falso positivo — revisar manualmente){C.RESET}")
 
 # ═══════════════════════════════════════════════════════════════════
-#   FASE 2 — Mejora 11: VALIDACIÓN DE DEPENDENCIAS
+#   VALIDACIÓN DE DEPENDENCIAS (Mejora 11)
 # ═══════════════════════════════════════════════════════════════════
+
 _BUILTIN_PKGS = {
     "path","fs","os","http","https","url","crypto","events","stream",
     "@angular/core","@angular/common","@angular/forms","@angular/router",
@@ -271,13 +367,11 @@ def _validate_dependencies(project_dir: Path, steps: list) -> list:
     return warnings
 
 # ═══════════════════════════════════════════════════════════════════
-#   BUG FIX #2+3: AUTO-FIX ANGULAR STANDALONE
-#   Elimina app.module.ts conflictivo, añade FormsModule, RouterLink, CommonModule
+#   AUTO-FIX ANGULAR STANDALONE
 # ═══════════════════════════════════════════════════════════════════
+
 def _inject_module_standalone(ts_content: str, module_name: str, from_pkg: str) -> str:
-    """Inyecta módulo(s) en imports[] de @Component standalone."""
     first_mod = module_name.split(",")[0].strip()
-    # 1. Añadir import statement si el primer módulo no está
     if first_mod not in ts_content:
         last_pos = 0
         for m in re.finditer(r'^import .+ from', ts_content, re.MULTILINE):
@@ -289,7 +383,6 @@ def _inject_module_standalone(ts_content: str, module_name: str, from_pkg: str) 
                          + ts_content[insert:])
         else:
             ts_content = f"import {{ {module_name} }} from '{from_pkg}';\n" + ts_content
-    # 2. Añadir al array imports[]
     def add_to_arr(m):
         arr = m.group(1)
         mods = [mod.strip() for mod in module_name.split(",")]
@@ -299,7 +392,6 @@ def _inject_module_standalone(ts_content: str, module_name: str, from_pkg: str) 
             return m.group(0).replace(arr, prefix + arr.lstrip())
         return m.group(0)
     ts_content = re.sub(r'imports\s*:\s*\[([^\]]*)\]', add_to_arr, ts_content, count=1)
-    # 3. Si no hay imports[], añadirlo
     if not re.search(r'imports\s*:', ts_content):
         ts_content = re.sub(r'(@Component\s*\(\s*\{)',
                             rf'\1\n  imports: [{module_name}],',
@@ -308,7 +400,6 @@ def _inject_module_standalone(ts_content: str, module_name: str, from_pkg: str) 
 
 def _autofix_angular_standalone(project_dir: Path, ng_major: int) -> list:
     fixes = []
-    # Fix 1: Eliminar app.module.ts si coexiste con app.config.ts (Angular 17+)
     if ng_major >= 17:
         mod_file = project_dir / "src/app/app.module.ts"
         cfg_file = project_dir / "src/app/app.config.ts"
@@ -318,12 +409,10 @@ def _autofix_angular_standalone(project_dir: Path, ng_major: int) -> list:
             P(f"  {C.YELLOW}  🗑  app.module.ts eliminado (conflicto standalone){C.RESET}")
             try: log_autofix("delete_ngmodule", ["src/app/app.module.ts"], ng_major)
             except: pass
-    # Fix 2-4: por cada componente
     for ts_file in sorted(project_dir.rglob("*.component.ts")):
         if "node_modules" in str(ts_file) or ".angular" in str(ts_file): continue
         try: ts_content = ts_file.read_text(encoding="utf-8", errors="replace")
         except: continue
-        # Template HTML
         html_file = ts_file.with_suffix(".html")
         if not html_file.exists():
             html_file = ts_file.parent / (ts_file.stem + ".html")
@@ -332,7 +421,6 @@ def _autofix_angular_standalone(project_dir: Path, ng_major: int) -> list:
             try: html = html_file.read_text(encoding="utf-8", errors="replace")
             except: pass
         changed = False; comp = ts_file.name
-        # Fix 2: FormsModule para [(ngModel)]
         if ng_major >= 17 and re.search(r'\[\(ngModel\)\]|ngModel', html):
             if "FormsModule" not in ts_content:
                 ts_content = _inject_module_standalone(ts_content, "FormsModule", "@angular/forms")
@@ -341,7 +429,6 @@ def _autofix_angular_standalone(project_dir: Path, ng_major: int) -> list:
                 try: log_autofix("add_formsmodule", [comp], ng_major)
                 except: pass
                 changed = True
-        # Fix 3: RouterLink/RouterOutlet
         if ng_major >= 17:
             need_link   = bool(re.search(r'routerLink\b|\[routerLink\]', html))
             need_outlet = bool(re.search(r'<router-outlet', html or ts_content))
@@ -357,7 +444,6 @@ def _autofix_angular_standalone(project_dir: Path, ng_major: int) -> list:
                 try: log_autofix("add_router", [comp], ng_major)
                 except: pass
                 changed = True
-        # Fix 4: CommonModule para *ngIf/*ngFor
         if re.search(r'\*ng(If|For|Switch|Class|Style)\b', html):
             if "CommonModule" not in ts_content and "NgIf" not in ts_content:
                 if ng_major >= 17:
@@ -378,6 +464,7 @@ def _autofix_angular_standalone(project_dir: Path, ng_major: int) -> list:
 # ═══════════════════════════════════════════════════════════════════
 #   SISTEMA
 # ═══════════════════════════════════════════════════════════════════
+
 def _run(cmd: str, cwd: Path, timeout: int = TIMEOUT_CMD) -> tuple:
     try:
         r = subprocess.run(cmd, shell=True, cwd=str(cwd), capture_output=True,
@@ -432,6 +519,7 @@ def _show_error_block(title: str, error: str):
 # ═══════════════════════════════════════════════════════════════════
 #   CONSULTA A LA IA
 # ═══════════════════════════════════════════════════════════════════
+
 def _ask_web(prompt: str, preferred_site: str, objetivo: str) -> str:
     try:
         _, [resp] = ask_ai_multiturn([prompt], preferred_site, objetivo)
@@ -444,6 +532,7 @@ def _ask_web(prompt: str, preferred_site: str, objetivo: str) -> str:
 # ═══════════════════════════════════════════════════════════════════
 #   VERIFICACIÓN DE HERRAMIENTAS
 # ═══════════════════════════════════════════════════════════════════
+
 _TOOL_VERSION_CMDS = {
     "node":"node --version","node.js":"node --version","nodejs":"node --version",
     "npm":"npm --version","npx":"npx --version",
@@ -489,6 +578,7 @@ def _check_tools_from_list(resp_prereq: str) -> dict:
 # ═══════════════════════════════════════════════════════════════════
 #   ESCANEO DE ESTRUCTURA
 # ═══════════════════════════════════════════════════════════════════
+
 SKIP_DIRS = {"node_modules",".git","dist",".angular","__pycache__",".vscode"}
 KEY_EXTS  = {".html",".css",".ts",".scss"}
 
@@ -512,8 +602,9 @@ def _scan_project(project_dir: Path) -> tuple:
     return "\n".join(tree_lines), key_files
 
 # ═══════════════════════════════════════════════════════════════════
-#   BUG FIX #2: REGLAS DE ARQUITECTURA ANGULAR EN PROMPTS
+#   REGLAS DE ARQUITECTURA ANGULAR EN PROMPTS
 # ═══════════════════════════════════════════════════════════════════
+
 def _ng_arch_rules(ng_major: int) -> str:
     if ng_major >= 17:
         return f"""
@@ -534,6 +625,7 @@ def _ng_arch_rules(ng_major: int) -> str:
 # ═══════════════════════════════════════════════════════════════════
 #   PROMPTS
 # ═══════════════════════════════════════════════════════════════════
+
 def _p1_prereqs(objetivo: str) -> str:
     return (
         f"Necesito {objetivo.rstrip('. ')}. "
@@ -651,9 +743,44 @@ def _p_fix_serve_strategy_change(objetivo: str, errors: str,
         f"Formato: PASO/CMD/FILE con contenido COMPLETO. El contenido empieza con código directo."
     )
 
+def _p_fix_serve_force_format(objetivo: str, errors: str,
+                               project_dir: Path, tools_str: str, ng_major: int=17) -> str:
+    """
+    v12.0: Prompt ultra-explícito cuando la IA no respondió en formato PASO/CMD/FILE.
+    Exige formato estricto sin texto libre.
+    """
+    _, key_files = _scan_project(project_dir)
+    key_config = _get_key_context_files(project_dir, ng_major)
+    config_ctx = ""
+    for rel, content in key_config.items():
+        config_ctx += f"\n--- {rel} ---\n{content[:500]}\n"
+    arch = _ng_arch_rules(ng_major)
+    return (
+        f"FORMATO OBLIGATORIO — responde ÚNICAMENTE con pasos, sin texto libre.\n\n"
+        f"Errores de compilación Angular v{ng_major}:\n```\n{errors}\n```\n\n"
+        f"{arch}\n"
+        f"Archivos actuales:\n{config_ctx}\n\n"
+        f"RESPONDE EXACTAMENTE ASÍ (sin introducción, sin explicación antes o después):\n\n"
+        f"PASO 1: [qué corriges]\n"
+        f"CMD: NINGUNO\n"
+        f"FILE: [ruta/del/archivo.ext]\n"
+        f"```\n"
+        f"[contenido COMPLETO del archivo corregido — empieza directamente con código]\n"
+        f"```\n\n"
+        f"PASO 2: [siguiente corrección si hay más]\n"
+        f"CMD: NINGUNO\n"
+        f"FILE: [ruta]\n"
+        f"```\n"
+        f"[contenido]\n"
+        f"```\n\n"
+        f"REGLA ABSOLUTA: Tu respuesta empieza con 'PASO 1:' y nada más.\n"
+        f"Tarea original: {objetivo}"
+    )
+
 # ═══════════════════════════════════════════════════════════════════
-#   PARSER
+#   PARSER — v11.6: strip de etiquetas concatenadas en FILE content
 # ═══════════════════════════════════════════════════════════════════
+
 _CONTAMINATED_PLAN_MARKERS = (
     "Isolated Segment",
     "window.__CF$cv$params",
@@ -661,16 +788,13 @@ _CONTAMINATED_PLAN_MARKERS = (
     "REGLAS CRÍTICAS:",
 )
 
-
 def _response_is_contaminated(response: str) -> bool:
     txt = response or ""
     return any(m in txt for m in _CONTAMINATED_PLAN_MARKERS)
 
-
 def _parse_plan(response: str) -> list:
     if _response_is_contaminated(response):
         return []
-
     steps = _parse_structured(response)
     if not steps: steps = _parse_natural(response)
     BLOCK = ("npm install -g",)
@@ -684,6 +808,10 @@ def _parse_plan(response: str) -> list:
     return result
 
 def _parse_structured(response: str) -> list:
+    """
+    Parser estructurado PASO/CMD/FILE.
+    v11.6: aplica _strip_concat_lang a la primera línea de cada bloque FILE.
+    """
     steps, lines, i = [], response.splitlines(), 0
     while i < len(lines):
         m = re.match(r'^PASO\s+\d+\s*[:\-]\s*(.+)', lines[i].strip(), re.IGNORECASE)
@@ -696,16 +824,18 @@ def _parse_structured(response: str) -> list:
             mc = re.match(r'^CMD\s*:\s*(.+)', l, re.IGNORECASE)
             if mc:
                 v = mc.group(1).strip()
-                if v.upper() not in ("NINGUNO","NONE","N/A",""): step["cmd"] = v
+                if v.upper() not in ("NINGUNO","NONE","N/A",""):
+                    v = _strip_concat_lang(v)
+                    step["cmd"] = v
                 i+=1; continue
             mf = re.match(r'^FILE\s*:\s*(.+)', l, re.IGNORECASE)
             if mf:
                 fpath = mf.group(1).strip(); i+=1; cl = []
                 if i < len(lines) and lines[i].strip() == "": i+=1
-                # BUG FIX: saltar etiquetas de lenguaje incluyendo "Código"
                 while i < len(lines) and _is_bare_lang_label(lines[i]): i+=1
                 uses_backticks = i < len(lines) and lines[i].strip().startswith("```")
                 if uses_backticks: i+=1
+                first_content_line = True
                 while i < len(lines):
                     cur = lines[i]; curs = cur.strip()
                     if uses_backticks and curs.startswith("```"): i+=1; break
@@ -713,6 +843,13 @@ def _parse_structured(response: str) -> list:
                     if not uses_backticks:
                         if re.match(r'^FILE\s*:', curs, re.IGNORECASE): break
                         if re.match(r'^CMD\s*:', curs, re.IGNORECASE): break
+                    if first_content_line and cur.strip():
+                        fixed = _strip_concat_lang(cur)
+                        if fixed != cur.strip():
+                            cur = fixed
+                        first_content_line = False
+                    else:
+                        first_content_line = False
                     cl.append(cur); i+=1
                 while cl and cl[-1].strip() == "": cl.pop()
                 if fpath and cl: step["files"].append({"path":fpath,"content":"\n".join(cl)})
@@ -774,6 +911,7 @@ def _parse_natural(response: str) -> list:
 # ═══════════════════════════════════════════════════════════════════
 #   EJECUTOR DE PASOS
 # ═══════════════════════════════════════════════════════════════════
+
 def _exec_step(step: dict, project_dir: Path, step_num: int, total: int) -> tuple:
     desc  = step.get("desc","")
     cmd   = step.get("cmd")
@@ -804,6 +942,7 @@ def _exec_step(step: dict, project_dir: Path, step_num: int, total: int) -> tupl
 # ═══════════════════════════════════════════════════════════════════
 #   LANZADOR
 # ═══════════════════════════════════════════════════════════════════
+
 _launched = False
 
 def _launch(workspace: Path, project_dir: Path,
@@ -830,15 +969,16 @@ def _launch(workspace: Path, project_dir: Path,
             except KeyboardInterrupt: pass
 
 # ═══════════════════════════════════════════════════════════════════
-#   ORQUESTADOR PRINCIPAL
+#   ORQUESTADOR PRINCIPAL — v12.0
 # ═══════════════════════════════════════════════════════════════════
+
 def run_orchestrator(objetivo: str, preferred_site: str=None) -> bool:
     global _launched
     _launched = False
     site_name = AI_SITES.get(preferred_site,{}).get("name","IA automática") if preferred_site else "IA automática"
 
     P(f"\n{C.CYAN}{C.BOLD}  ╔══════════════════════════════════════╗")
-    P(f"  ║   🤖 ORQUESTADOR SONNY  v11.4       ║")
+    P(f"  ║   🤖 ORQUESTADOR SONNY  v12.0       ║")
     P(f"  ╚══════════════════════════════════════╝{C.RESET}")
     P(f"  {C.DIM}Objetivo : {objetivo}{C.RESET}")
     P(f"  {C.DIM}Cerebro  : {site_name}{C.RESET}\n")
@@ -900,7 +1040,11 @@ def run_orchestrator(objetivo: str, preferred_site: str=None) -> bool:
     for line in resp_create.splitlines():
         clean = line.strip().lstrip("`$> ").strip()
         if _is_bare_lang_label(clean): continue
-        if clean.lower().startswith("ng new"): create_cmd = clean; break
+        clean = _strip_concat_lang(clean)
+        if clean.lower().startswith("ng new"):
+            create_cmd = clean
+            break
+
     if not create_cmd:
         create_cmd = "ng new mi-app --style=css --skip-git --defaults"
         P(f"  {C.YELLOW}  ⚠️  ng new no detectado — usando default{C.RESET}")
@@ -930,6 +1074,7 @@ def run_orchestrator(objetivo: str, preferred_site: str=None) -> bool:
                 for line in fix_resp.splitlines():
                     clean = line.strip().lstrip("`$> ").strip()
                     if _is_bare_lang_label(clean): continue
+                    clean = _strip_concat_lang(clean)
                     if clean.lower().startswith("ng new"):
                         create_cmd = _force_skip_install(clean)
                         for item in workspace.iterdir():
@@ -953,7 +1098,6 @@ def run_orchestrator(objetivo: str, preferred_site: str=None) -> bool:
     for f in list(key_files.keys())[:10]: P(f"  {C.DIM}    📄 {f}{C.RESET}")
     if len(key_files) > 10: P(f"  {C.DIM}    ... y {len(key_files)-10} más{C.RESET}")
 
-    # MEJORA 7: obtener archivos de configuración completos
     key_config = _get_key_context_files(project_dir, ng_major)
 
     # ── TURNO 3 ─────────────────────────────────────────────────────
@@ -976,7 +1120,6 @@ def run_orchestrator(objetivo: str, preferred_site: str=None) -> bool:
         log_error(site_name, f"No steps parsed: {resp_steps[:300]}")
         return False
 
-    # MEJORA 11: validación de dependencias
     dep_warnings = _validate_dependencies(project_dir, steps)
     if dep_warnings:
         P(f"\n  {C.YELLOW}  ⚠️  Advertencias de dependencias:{C.RESET}")
@@ -1004,14 +1147,28 @@ def run_orchestrator(objetivo: str, preferred_site: str=None) -> bool:
             tree, key_files = _scan_project(project_dir)
         if not ok:
             fixed = False
-            for attempt in range(1, MAX_FIX_ATTEMPTS+1):
-                P(f"\n  {C.YELLOW}  ⚠️  Error paso {step_num}. Consultando {site_name} ({attempt}/{MAX_FIX_ATTEMPTS})...{C.RESET}\n")
+            attempt = 0
+            while True:
+                attempt += 1
+                P(f"\n  {C.YELLOW}  ⚠️  Error paso {step_num}. Consultando {site_name} (intento {attempt})...{C.RESET}\n")
                 ejecutado = step.get("cmd") or str([f["path"] for f in step.get("files",[])])
                 fix_p = _p_fix_step(objetivo, step["desc"], ejecutado, error_out, verified_tools, ng_major)
                 fix_resp = _ask_web(fix_p, preferred_site, objetivo)
-                if not fix_resp: break
+                if not fix_resp:
+                    P(f"  {C.RED}  ❌ Sin respuesta de la IA. Reintentando...{C.RESET}")
+                    continue
                 fix_steps = [s for s in _parse_plan(fix_resp) if not s.get("_is_serve")]
-                if not fix_steps: break
+                if not fix_steps:
+                    P(f"  {C.YELLOW}  ⚠️  Sin pasos. Reintentando con formato explícito...{C.RESET}")
+                    fix_resp2 = _ask_web(
+                        _p_fix_serve_force_format(objetivo, error_out, project_dir, "", ng_major),
+                        preferred_site, objetivo
+                    )
+                    if fix_resp2:
+                        fix_steps = [s for s in _parse_plan(fix_resp2) if not s.get("_is_serve")]
+                    if not fix_steps:
+                        P(f"  {C.YELLOW}  ⚠️  Aún sin pasos ejecutables. Saltando...{C.RESET}")
+                        break
                 all_fix_ok = True
                 for fi, fs in enumerate(fix_steps, 1):
                     fok, ferr = _exec_step(fs, project_dir, fi, len(fix_steps))
@@ -1020,14 +1177,17 @@ def run_orchestrator(objetivo: str, preferred_site: str=None) -> bool:
                 if all_fix_ok:
                     P(f"  {C.GREEN}  ✅ Corrección exitosa{C.RESET}")
                     fixed = True; break
+                if attempt >= 5:
+                    P(f"  {C.YELLOW}  ⚠️  5 intentos fallidos en paso {step_num}.{C.RESET}")
+                    break
             if not fixed:
                 P(f"\n  {C.RED}  ❌ Paso {step_num} sin resolver.{C.RESET}")
-                r = input(f"  {C.YELLOW}¿Continuar? (s/n) > {C.RESET}").strip().lower()
+                r = input(f"  {C.YELLOW}¿Continuar de todas formas? (s/n) > {C.RESET}").strip().lower()
                 if not r or r[0] not in ("s","y"):
                     P(f"  {C.RED}  Detenido.{C.RESET}")
                     return False
 
-    # ── Auto-fix standalone (BUG FIX #2+3) ──────────────────────────
+    # ── Auto-fix standalone ──────────────────────────────────────────
     P(f"\n  {C.DIM}  Aplicando auto-fix standalone (ngModel, RouterLink, CommonModule)...{C.RESET}")
     _autofix_angular_standalone(project_dir, ng_major)
 
@@ -1065,8 +1225,9 @@ def run_orchestrator_with_site(objetivo: str) -> bool:
     return run_orchestrator(objetivo, preferred_site=site)
 
 # ═══════════════════════════════════════════════════════════════════
-#   SERVE + FIX LOOP — BUG FIX #4: Anti-loop v2 (error codes)
+#   SERVE + FIX LOOP — v12.0: SIN LÍMITE DE INTENTOS
 # ═══════════════════════════════════════════════════════════════════
+
 def _extract_build_errors(output: str) -> str:
     lines = output.splitlines()
     error_lines = []
@@ -1094,28 +1255,32 @@ def _has_build_errors(output: str) -> bool:
     return _has_functional_warnings(output)
 
 def _serve_and_fix(project_dir: Path, objetivo: str, preferred_site: str,
-                   verified_tools: dict, ng_major: int=17, max_fix_rounds: int=3):
+                   verified_tools: dict, ng_major: int=17):
     """
-    Ejecuta ng build, detecta errores, corrige con IA y reintenta.
-    BUG FIX #4: Anti-loop v2 — rastrea error codes entre rondas.
-      Si los MISMOS códigos (TS2304, NG8002, etc.) persisten 2+ rondas
-      → fuerza estrategia diferente aunque el hash de archivos cambie.
+    v12.0: Loop de compilación y corrección SIN LÍMITE DE INTENTOS.
+    Usa Ctrl+C para detener si no quiere seguir intentando.
     """
     tools_str = ", ".join(f"{n} {i['version']}" for n,i in verified_tools.items() if i["ok"])
+    site_name = AI_SITES.get(preferred_site,{}).get("name","IA") if preferred_site else "IA"
+
     subprocess.run("ng analytics disable --global", shell=True,
                    cwd=str(project_dir), capture_output=True, env=CLI_ENV)
 
     last_hash = ""
-    error_codes_history = []  # BUG FIX #4: historial de sets de error codes
+    error_codes_history = []
+    fix_round = 0
+    no_change_streak = 0
 
-    for fix_round in range(max_fix_rounds + 1):
-        if fix_round == 0:
+    P(f"\n  {C.CYAN}{C.BOLD}  ℹ️  Fix loop activo — Ctrl+C para detener en cualquier momento{C.RESET}\n")
+
+    while True:
+        fix_round += 1
+        if fix_round == 1:
             P(f"\n  {C.GREEN}{C.BOLD}🚀 Iniciando ng serve...{C.RESET}")
         else:
-            P(f"\n  {C.CYAN}  🔄 Reintentando ng serve (ronda {fix_round}/{max_fix_rounds})...{C.RESET}")
+            P(f"\n  {C.CYAN}  🔄 Reintentando ng serve (ronda {fix_round})...{C.RESET}")
 
-        # Auto-fix antes de compilar
-        if fix_round > 0:
+        if fix_round > 1:
             _autofix_angular_standalone(project_dir, ng_major)
 
         P(f"  {C.DIM}  Compilando proyecto para detectar errores...{C.RESET}")
@@ -1124,56 +1289,45 @@ def _serve_and_fix(project_dir: Path, objetivo: str, preferred_site: str,
 
         if _has_build_errors(build_out) or not ok_build:
             errors = _extract_build_errors(build_out)
-
-            # BUG FIX #4: extraer y registrar error codes de esta ronda
             curr_codes = _extract_error_codes(build_out)
             error_codes_history.append(curr_codes)
 
-            _show_error_block(f"Errores (ronda {fix_round+1}/{max_fix_rounds})", errors)
-
-            # MEJORA 9: log de error de build
+            _show_error_block(f"Errores (ronda {fix_round})", errors)
             try: log_build_error(fix_round, list(curr_codes), errors[:500], ng_major)
             except: pass
 
-            if fix_round >= max_fix_rounds:
-                P(f"  {C.RED}  ❌ Se agotaron los intentos.{C.RESET}")
-                P(f"  {C.YELLOW}  El proyecto está en: {project_dir}{C.RESET}")
-                P(f"  {C.YELLOW}  Puedes abrirlo manualmente con: ng serve{C.RESET}")
-                try: log_session_end(objetivo, success=False, total_rounds=fix_round, ng_major=ng_major)
-                except: pass
-                break
-
-            # BUG FIX #4: detectar si los MISMOS error codes persisten
             current_hash = _get_files_hash(project_dir)
             hash_changed = current_hash != last_hash
+            if not hash_changed and fix_round > 1:
+                no_change_streak += 1
+            else:
+                no_change_streak = 0
             last_hash = current_hash
 
-            # Si hay al menos 2 rondas y los mismos codes se repiten → estrategia diferente
             persistent_codes = set()
             if len(error_codes_history) >= 2:
                 persistent_codes = error_codes_history[-1] & error_codes_history[-2]
 
-            site_name = AI_SITES.get(preferred_site,{}).get("name","IA") if preferred_site else "IA"
-            P(f"\n  {C.MAGENTA}{C.BOLD}  🤖 Consultando {site_name}...{C.RESET}\n")
-
             use_strategy_change = (
-                (persistent_codes and fix_round > 0) or
-                (not hash_changed and fix_round > 0)
+                (persistent_codes and fix_round > 1) or
+                (not hash_changed and fix_round > 1)
             )
+
+            P(f"\n  {C.MAGENTA}{C.BOLD}  🤖 Consultando {site_name}...{C.RESET}\n")
 
             if use_strategy_change:
                 reason = f"códigos persistentes: {persistent_codes}" if persistent_codes else "estado sin cambios"
                 P(f"  {C.YELLOW}  ⚠️  {reason} → cambiando estrategia{C.RESET}")
                 fix_prompt = _p_fix_serve_strategy_change(
-                    objetivo, errors, project_dir, tools_str, ng_major, fix_round+1
+                    objetivo, errors, project_dir, tools_str, ng_major, fix_round
                 )
             else:
                 fix_prompt = _p_fix_serve(objetivo, errors, project_dir, tools_str, ng_major)
 
             fix_resp = _ask_web(fix_prompt, preferred_site, objetivo)
             if not fix_resp:
-                P(f"  {C.RED}  Sin respuesta de la IA.{C.RESET}")
-                break
+                P(f"  {C.RED}  ❌ Sin respuesta de la IA. Reintentando en próxima ronda...{C.RESET}")
+                continue
 
             P(f"  {C.CYAN}  💬 {site_name} — corrección:{C.RESET}")
             for l in fix_resp.strip().splitlines()[:6]:
@@ -1181,37 +1335,47 @@ def _serve_and_fix(project_dir: Path, objetivo: str, preferred_site: str,
             P(f"  {C.DIM}    ...{C.RESET}\n")
 
             fix_steps = [s for s in _parse_plan(fix_resp) if not s.get("_is_serve")]
-            if not fix_steps:
-                P(f"  {C.YELLOW}  ⚠️  No se encontraron pasos.{C.RESET}")
-                break
 
-            P(f"  {C.BOLD}  📋 Aplicando {len(fix_steps)} corrección(es):{C.RESET}")
+            if not fix_steps:
+                P(f"  {C.YELLOW}  ⚠️  No se encontraron pasos — reintentando con formato explícito...{C.RESET}")
+                fix_resp2 = _ask_web(
+                    _p_fix_serve_force_format(objetivo, errors, project_dir, tools_str, ng_major),
+                    preferred_site, objetivo
+                )
+                if fix_resp2:
+                    P(f"  {C.CYAN}  💬 {site_name} — respuesta formato forzado:{C.RESET}")
+                    for l in fix_resp2.strip().splitlines()[:6]:
+                        P(f"  {C.DIM}    {l.strip()[:100]}{C.RESET}")
+                    P(f"  {C.DIM}    ...{C.RESET}\n")
+                    fix_steps = [s for s in _parse_plan(fix_resp2) if not s.get("_is_serve")]
+
+            if not fix_steps:
+                P(f"  {C.YELLOW}  ⚠️  Sin pasos ejecutables tras 2 intentos. Reintentando compilación...{C.RESET}")
+                continue
+
+            P(f"  {C.BOLD}{C.MAGENTA}━━━ SONNY aplica {len(fix_steps)} corrección(es) (ronda {fix_round}) ━━━{C.RESET}")
             files_changed = []
             all_ok = True
             for fi, fs in enumerate(fix_steps, 1):
                 fok, ferr = _exec_step(fs, project_dir, fi, len(fix_steps))
                 files_changed += [f["path"] for f in fs.get("files",[])]
                 if not fok:
-                    _show_error_block(f"Fix {fi} falló", ferr)
+                    _show_error_block(f"Fix paso {fi} falló", ferr)
                     all_ok = False; break
 
-            # MEJORA 9: log del fix aplicado
             try:
                 strategy = "strategy_change" if use_strategy_change else "normal"
                 log_fix_applied(fix_round, files_changed, strategy)
             except: pass
 
             if not all_ok:
-                P(f"  {C.YELLOW}  ⚠️  Algún fix falló, reintentando...{C.RESET}")
+                P(f"  {C.YELLOW}  ⚠️  Algún fix falló, reintentando compilación...{C.RESET}")
 
             continue
 
         else:
-            # ✅ Compilación exitosa
             P(f"  {C.GREEN}  ✅ Compilación exitosa — lanzando servidor...{C.RESET}")
-            # MEJORA 8: validación semántica
             _semantic_validation_warning(objetivo, project_dir)
-            # MEJORA 9: log de sesión exitosa
             try: log_session_end(objetivo, success=True, total_rounds=fix_round, ng_major=ng_major)
             except: pass
             P(f"\n  {C.GREEN}{C.BOLD}🚀 Angular listo — http://localhost:4200{C.RESET}")
