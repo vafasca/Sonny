@@ -9,12 +9,35 @@ import asyncio
 import json
 import re
 import threading
+from typing import Any
 
 from core.browser import BrowserSession, AI_SITES, check_playwright, install_playwright, C
 from core.web_log  import log_prompt, log_response, log_error
 
 SITE_PRIORITY = ["claude", "chatgpt", "gemini", "qwen"]
 _PERSISTENT_SESSIONS: dict[str, BrowserSession] = {}
+
+ARTIFACT_TEXT_MIME_PREFIXES = ("text/",)
+ARTIFACT_TEXT_MIME_EXACT = {
+    "application/json",
+    "application/javascript",
+    "application/xml",
+    "application/x-yaml",
+    "application/yaml",
+    "application/csv",
+}
+ARTIFACT_ARCHIVE_MIME = {
+    "application/zip",
+    "application/x-zip-compressed",
+    "application/gzip",
+}
+
+_CONTAMINATED_RESPONSE_MARKERS = (
+    "ARCHIVOS DE CONFIGURACIÓN ACTUALES (COMPLETOS):",
+    "ESTRUCTURA REAL DEL PROYECTO:",
+    "REGLAS CRÍTICAS:",
+    "Dame pasos corregidos en formato PASO/CMD/FILE",
+)
 
 # Runtime async persistente en hilo aparte para no romper objetos Playwright
 # entre múltiples llamadas síncronas a ask_ai_multiturn().
@@ -30,6 +53,11 @@ def parse_steps(response: str) -> list[dict]:
       1. JSON (formato preferido): {"steps": [{"description":..., "cmd":..., "files":[...]}]}
       2. Texto con comandos (fallback): líneas que empiezan con npm/ng/pip/etc.
     """
+    # Intento 0: artifacts de Claude serializados como JSON dentro del texto
+    artifact_steps = _parse_steps_from_artifacts(response)
+    if artifact_steps:
+        return artifact_steps
+
     # Intento 1: JSON
     json_steps = _parse_steps_json(response)
     if json_steps is not None:
@@ -37,6 +65,119 @@ def parse_steps(response: str) -> list[dict]:
 
     # Fallback: parseo de texto con comandos
     return _parse_steps_text(response)
+
+
+def _looks_like_text_mime(mime: str) -> bool:
+    mime = (mime or "").lower().strip()
+    return mime.startswith(ARTIFACT_TEXT_MIME_PREFIXES) or mime in ARTIFACT_TEXT_MIME_EXACT
+
+
+def _coerce_artifact_candidate(obj: Any) -> dict[str, Any] | None:
+    """Normaliza variantes comunes de artifact en respuestas Claude/API gateway."""
+    if not isinstance(obj, dict):
+        return None
+
+    mime = str(obj.get("mime_type") or obj.get("mimeType") or obj.get("content_type") or "").strip()
+    filename = str(obj.get("filename") or obj.get("name") or obj.get("path") or "").strip()
+    url = str(obj.get("url") or obj.get("download_url") or obj.get("downloadUrl") or "").strip()
+    content = obj.get("content")
+    text = obj.get("text")
+    if content is None and text is not None:
+        content = text
+
+    if not any((mime, filename, url, content is not None)):
+        return None
+
+    return {
+        "filename": filename,
+        "mime_type": mime,
+        "url": url,
+        "content": content,
+    }
+
+
+def _walk_artifact_objects(node: Any) -> list[dict[str, Any]]:
+    """Recorre estructuras arbitrarias para rescatar artifacts embebidos."""
+    found: list[dict[str, Any]] = []
+
+    if isinstance(node, dict):
+        candidate = _coerce_artifact_candidate(node)
+        if candidate:
+            found.append(candidate)
+        for v in node.values():
+            found.extend(_walk_artifact_objects(v))
+    elif isinstance(node, list):
+        for item in node:
+            found.extend(_walk_artifact_objects(item))
+
+    return found
+
+
+def _parse_steps_from_artifacts(response: str) -> list[dict]:
+    """
+    Extrae comandos desde artifacts serializados en JSON.
+    Útil cuando Claude responde con archivos adjuntos/metadatos en vez de texto plano.
+    """
+    clean = response.strip()
+    if not clean:
+        return []
+
+    parsed: Any = None
+    try:
+        parsed = json.loads(clean)
+    except json.JSONDecodeError:
+        m = re.search(r'\{.*\}', clean, re.DOTALL)
+        if m:
+            try:
+                parsed = json.loads(m.group())
+            except json.JSONDecodeError:
+                return []
+        else:
+            return []
+
+    artifacts = _walk_artifact_objects(parsed)
+    if not artifacts:
+        return []
+
+    commands: list[dict[str, str]] = []
+    seen: set[str] = set()
+
+    for art in artifacts:
+        mime = (art.get("mime_type") or "").lower()
+        filename = art.get("filename") or ""
+        content = art.get("content")
+        url = art.get("url") or ""
+
+        if mime in ARTIFACT_ARCHIVE_MIME:
+            if url and f"download {url}" not in seen:
+                seen.add(f"download {url}")
+                commands.append({"type": "cmd", "value": f"curl -L '{url}' -o artifact.zip"})
+            continue
+
+        if content is None or not _looks_like_text_mime(mime):
+            continue
+
+        if not isinstance(content, str):
+            try:
+                content = json.dumps(content, ensure_ascii=False)
+            except Exception:
+                continue
+
+        content_commands = _parse_steps_text(content)
+        for c in content_commands:
+            value = c.get("value")
+            if value and value not in seen:
+                seen.add(value)
+                commands.append(c)
+
+        if filename and filename.lower().endswith((".sh", ".bash")):
+            for line in content.splitlines():
+                line = line.strip()
+                if line and not line.startswith("#") and line not in seen:
+                    seen.add(line)
+                    commands.append({"type": "cmd", "value": line})
+
+    return commands
 
 
 def _parse_steps_json(response: str) -> list[dict] | None:
@@ -106,6 +247,42 @@ def _parse_steps_text(response: str) -> list[dict]:
             seen.add(line)
             steps.append({"type":"cmd","value":line})
     return steps
+
+
+def _strip_isolated_segments(text: str) -> str:
+    """Elimina ruido de Cloudflare/iframes que a veces queda pegado al copiar DOM."""
+    clean = text or ""
+    clean = re.sub(r'\n?\s*Isolated Segment\s*\n\s*\(function\(\)\{.*?\}\)\(\);?', '', clean, flags=re.DOTALL)
+    clean = re.sub(r'window\.__CF\$cv\$params=.*?appendChild\(a\);', '', clean, flags=re.DOTALL)
+    return clean.strip()
+
+
+def _looks_like_prompt_echo(response: str, prompt: str) -> bool:
+    """
+    Detecta respuestas contaminadas donde Claude devuelve el prompt completo
+    (estructura, reglas, config) en lugar de un plan ejecutable.
+    """
+    if not response:
+        return False
+
+    if any(marker in response for marker in _CONTAMINATED_RESPONSE_MARKERS):
+        return True
+
+    prompt_norm = re.sub(r'\s+', ' ', (prompt or '').strip().lower())
+    resp_norm = re.sub(r'\s+', ' ', response.strip().lower())
+    if prompt_norm and len(prompt_norm) > 60 and prompt_norm in resp_norm:
+        if resp_norm.count('paso ') <= 1 and resp_norm.count('cmd:') <= 1:
+            return True
+
+    return False
+
+
+def _sanitize_response_for_execution(response: str, prompt: str) -> str:
+    """Limpia ruido y bloquea respuestas contaminadas para evitar ejecuciones incorrectas."""
+    clean = _strip_isolated_segments(response)
+    if _looks_like_prompt_echo(clean, prompt):
+        return ""
+    return clean
 
 
 def _runtime_loop_worker(loop: asyncio.AbstractEventLoop):
@@ -208,14 +385,16 @@ async def _run_multiturn(prompts: list[str], site_key: str, objetivo: str) -> li
             session = fresh
             resp = await session.send_prompt(prompt)
 
-        if not resp or len(resp) < 20:
-            log_error(site_name, f"Turno {idx}: respuesta vacía")
-            print(f"  ⚠️  Turno {idx}: sin respuesta", flush=True)
+        clean_resp = _sanitize_response_for_execution(resp or "", prompt)
+        if not clean_resp or len(clean_resp) < 20:
+            reason = "respuesta vacía" if not (resp or "").strip() else "respuesta inválida/contaminada"
+            log_error(site_name, f"Turno {idx}: {reason}")
+            print(f"  ⚠️  Turno {idx}: sin respuesta usable", flush=True)
             responses.append("")
         else:
-            log_response(site_name, resp, len(parse_steps(resp)))
-            print(f"  ✅ Turno {idx}: {len(resp)} chars", flush=True)
-            responses.append(resp)
+            log_response(site_name, clean_resp, len(parse_steps(clean_resp)))
+            print(f"  ✅ Turno {idx}: {len(clean_resp)} chars", flush=True)
+            responses.append(clean_resp)
 
     return responses
 
