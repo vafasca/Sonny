@@ -1,3 +1,4 @@
+import re
 import sys
 import tempfile
 import types
@@ -342,8 +343,8 @@ export class AppComponent {}""",
         base = Path(tempfile.mkdtemp(prefix="sonny_planner_ctx_"))
         task = base / "task_ctx"
         project = task / "proj"
-        (project / "src" / "app" / "contact").mkdir(parents=True, exist_ok=True)
-        (project / "src" / "app" / "contact" / "contact.component.html").write_text(
+        (project / "src" / "app" / "lead-form").mkdir(parents=True, exist_ok=True)
+        (project / "src" / "app" / "lead-form" / "lead-form.component.html").write_text(
             '<input [(ngModel)]="form.nombre" />',
             encoding="utf-8",
         )
@@ -369,8 +370,44 @@ export class AppComponent {}""",
         self.assertTrue(result["ok"])
         self.assertTrue(result.get("prompt_context_files"))
         self.assertIn("CONTENIDO REAL DEL PROYECTO EN DISCO", captured["prompt"])
-        self.assertIn("[ARCHIVO REAL EN DISCO: src/app/contact/contact.component.html]", captured["prompt"])
+        self.assertIn("[ARCHIVO REAL EN DISCO: src/app/lead-form/lead-form.component.html]", captured["prompt"])
         self.assertIn("[(ngModel)]", captured["prompt"])
+
+    def test_planner_call_limits_total_context_size_before_calling_llm(self):
+        base = Path(tempfile.mkdtemp(prefix="sonny_planner_ctx_limit_"))
+        task = base / "task_ctx_limit"
+        project = task / "proj"
+        (project / "src" / "app").mkdir(parents=True, exist_ok=True)
+
+        big_a = "A" * (agent_mod.MAX_CONTEXT_TOTAL_BYTES // 2 + 300)
+        big_b = "B" * (agent_mod.MAX_CONTEXT_TOTAL_BYTES // 2 + 300)
+        big_c = "C" * (agent_mod.MAX_CONTEXT_TOTAL_BYTES // 2 + 300)
+        (project / "src" / "app" / "one.component.html").write_text(big_a, encoding="utf-8")
+        (project / "src" / "app" / "two.component.html").write_text(big_b, encoding="utf-8")
+        (project / "src" / "app" / "three.component.html").write_text(big_c, encoding="utf-8")
+
+        state = AgentState()
+        state.set_task_workspace(task)
+        state.set_project_root(project)
+
+        captured = {"prompt": ""}
+        original = agent_mod.call_llm
+        agent_mod.call_llm = lambda prompt: captured.__setitem__("prompt", prompt) or "ok"
+        try:
+            agent_mod.planner_call(
+                {
+                    "type": "llm_call",
+                    "prompt": "Analiza html y accesibilidad del formulario",
+                },
+                {"workspace": task, "state": state},
+            )
+        finally:
+            agent_mod.call_llm = original
+
+        injected = captured["prompt"].split("CONTENIDO REAL DEL PROYECTO EN DISCO", 1)[-1]
+        extracted_payload = re.findall(r"```\n([\s\S]*?)\n```", injected)
+        total_injected_chars = sum(len(chunk) for chunk in extracted_payload)
+        self.assertLessEqual(total_injected_chars, agent_mod.MAX_CONTEXT_TOTAL_BYTES)
 
     def test_planner_call_fallbacks_to_tree_when_no_keyword_match(self):
         base = Path(tempfile.mkdtemp(prefix="sonny_planner_tree_"))
