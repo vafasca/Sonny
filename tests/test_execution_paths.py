@@ -14,7 +14,7 @@ ai_scraper_stub.available_sites = lambda: ["chatgpt", "claude", "gemini", "qwen"
 sys.modules["core.ai_scraper"] = ai_scraper_stub
 
 from core.agent import ExecutorError, execute_command, modify_file, write_file, _block_interactive_commands, ActionExecutor
-from core.orchestrator import _build_task_workspace, _parse_angular_cli_version, _snapshot_project_files, _strip_ansi, _build_angular_rules, _validate_action_consistency, _sanitize_project_name, _build_ng_new_command
+from core.orchestrator import _build_task_workspace, _parse_angular_cli_version, _snapshot_project_files, _strip_ansi, _build_angular_rules, _validate_action_consistency, _sanitize_project_name, _build_ng_new_command, _project_has_lint_target
 from core.state_manager import AgentState
 from core import planner as planner_mod
 import core.agent as agent_mod
@@ -436,6 +436,66 @@ export class AppComponent {}""",
 
         self.assertIn("ÁRBOL REAL DEL PROYECTO", captured["prompt"])
         self.assertIn("src/app/app.component.ts", captured["prompt"])
+
+
+    def test_nested_actions_do_not_increment_phase_action_count(self):
+        base = Path(tempfile.mkdtemp(prefix="sonny_nested_count_"))
+        task = base / "task_nested_count"
+        task.mkdir(parents=True, exist_ok=True)
+
+        state = AgentState()
+        state.set_task_workspace(task)
+        state.set_phase("Desarrollo de componentes")
+
+        nested_payload = {
+            "actions": [
+                {"type": "file_write", "path": "src/app/a.ts", "content": "export const a = 1;"},
+                {"type": "file_write", "path": "src/app/b.ts", "content": "export const b = 1;"},
+                {"type": "file_write", "path": "src/app/c.ts", "content": "export const c = 1;"},
+            ]
+        }
+
+        original = agent_mod.call_llm
+        agent_mod.call_llm = lambda prompt: __import__("json").dumps(nested_payload)
+        try:
+            executor = ActionExecutor(workspace=task)
+            executor.execute_actions({"actions": [{"type": "llm_call", "prompt": "genera tests"}]}, state)
+        finally:
+            agent_mod.call_llm = original
+
+        self.assertEqual(state.phase_action_count, 1)
+        self.assertEqual(len(state.action_history), 4)
+
+    def test_execute_actions_checks_loop_guard_per_action(self):
+        base = Path(tempfile.mkdtemp(prefix="sonny_action_limit_"))
+        task = base / "task_action_limit"
+        task.mkdir(parents=True, exist_ok=True)
+
+        state = AgentState()
+        state.set_task_workspace(task)
+        state.set_phase("Fase extensa")
+
+        actions = [
+            {"type": "file_write", "path": f"src/app/file_{idx}.ts", "content": "export const x = 1;"}
+            for idx in range(11)
+        ]
+
+        executor = ActionExecutor(workspace=task)
+        with self.assertRaises(ExecutorError):
+            executor.execute_actions({"actions": actions}, state)
+
+        self.assertEqual(state.phase_action_count, 11)
+
+    def test_project_has_lint_target_detection(self):
+        base = Path(tempfile.mkdtemp(prefix="sonny_lint_target_"))
+        project = base / "proj"
+        project.mkdir(parents=True, exist_ok=True)
+
+        (project / "angular.json").write_text('{"projects":{"app":{"architect":{"lint":{}}}}}', encoding="utf-8")
+        self.assertTrue(_project_has_lint_target(project))
+
+        (project / "angular.json").write_text('{"projects":{"app":{"architect":{}}}}', encoding="utf-8")
+        self.assertFalse(_project_has_lint_target(project))
 
     def test_llm_call_nested_depth_limit(self):
         base = Path(tempfile.mkdtemp(prefix="sonny_nested_depth_"))

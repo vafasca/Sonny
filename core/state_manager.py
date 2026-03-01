@@ -35,10 +35,17 @@ class AgentState:
         if phase_name not in self.completed_phases:
             self.completed_phases.append(phase_name)
 
-    def register_action(self, action: dict[str, Any], result: dict[str, Any]) -> None:
+    def register_action(
+        self,
+        action: dict[str, Any],
+        result: dict[str, Any],
+        *,
+        count_for_phase: bool = True,
+    ) -> None:
         action_type = action.get("type", "unknown")
         self.action_history.append({"phase": self.current_phase, "action": action, "result": result})
-        self.phase_action_count += 1
+        if count_for_phase:
+            self.phase_action_count += 1
         self.tool_usage_count[action_type] += 1
 
     def increment_iteration(self) -> None:

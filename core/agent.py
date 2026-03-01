@@ -14,6 +14,7 @@ from typing import Any
 from core.action_registry import ALLOWED_ACTIONS
 from core.ai_scraper import call_llm
 from core.state_manager import AgentState
+from core.loop_guard import LoopGuard, LoopGuardError
 from core.validator import validate_actions, ValidationError
 from core.web_log import log_action_blocked, log_error
 
@@ -84,8 +85,14 @@ class ActionExecutor:
                 log_error("executor", f"Acción bloqueada/fallida ({action_type}): {exc}")
                 result = {"ok": False, "error": str(exc)}
 
-            state.register_action(action, result)
+            is_root_action = nested_depth == 0
+            state.register_action(action, result, count_for_phase=is_root_action)
             results.append(result)
+
+            try:
+                LoopGuard.check(state)
+            except LoopGuardError as exc:
+                raise ExecutorError(str(exc)) from exc
 
         return results
 

@@ -282,6 +282,22 @@ def _sync_state_before_phase(state: AgentState, task_workspace: Path) -> None:
         state.angular_project_version = _angular_project_version(project)
 
 
+def _project_has_lint_target(project_root: Path | None) -> bool:
+    if not project_root:
+        return False
+
+    angular_file = Path(project_root) / "angular.json"
+    if not angular_file.exists():
+        return False
+
+    try:
+        content = angular_file.read_text(encoding="utf-8", errors="replace")
+    except Exception:
+        return False
+
+    return '"lint"' in content
+
+
 def _phase_generates_code(actions_payload: dict) -> bool:
     actions = actions_payload.get("actions", [])
     for action in actions:
@@ -462,7 +478,7 @@ def run_orchestrator(
             "valid_commands": [
                 "ng build --configuration production (NO --prod)",
                 "ng test --no-watch --browsers=ChromeHeadless",
-                "ng lint (requiere angular-eslint)",
+                *(["ng lint (requiere angular-eslint)"] if _project_has_lint_target(state.project_root) else []),
                 "ng e2e",
             ],
             "deprecated_commands": ["ng build --prod"],
