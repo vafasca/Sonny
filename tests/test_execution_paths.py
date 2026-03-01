@@ -63,6 +63,48 @@ class TestExecutionPaths(unittest.TestCase):
                 {"workspace": task, "state": state},
             )
 
+    def test_write_file_unescapes_literal_newlines(self):
+        base = Path(tempfile.mkdtemp(prefix="sonny_escape_write_"))
+        task = base / "task_escape_w"
+        task.mkdir(parents=True, exist_ok=True)
+
+        state = AgentState()
+        state.set_task_workspace(task)
+
+        write_file(
+            {
+                "type": "file_write",
+                "path": "src/app/app.ts",
+                "content": "import { A } from 'a';\nexport class App {}\n",
+            },
+            {"workspace": task, "state": state},
+        )
+
+        content = (task / "src" / "app" / "app.ts").read_text(encoding="utf-8")
+        self.assertIn("\nexport class App", content)
+        self.assertNotIn("\\n", content)
+
+    def test_modify_file_unescapes_literal_newlines(self):
+        base = Path(tempfile.mkdtemp(prefix="sonny_escape_modify_"))
+        task = base / "task_escape_m"
+        task.mkdir(parents=True, exist_ok=True)
+
+        state = AgentState()
+        state.set_task_workspace(task)
+
+        modify_file(
+            {
+                "type": "file_modify",
+                "path": "src/app/app.html",
+                "content": "<main>\n  <h1>Título</h1>\n</main>\n",
+            },
+            {"workspace": task, "state": state},
+        )
+
+        content = (task / "src" / "app" / "app.html").read_text(encoding="utf-8")
+        self.assertIn("\n  <h1>", content)
+        self.assertNotIn("\\n", content)
+
     def test_modify_fallback_to_write(self):
         base = Path(tempfile.mkdtemp(prefix="sonny_modify_"))
         task = base / "task3"

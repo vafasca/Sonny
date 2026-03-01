@@ -307,6 +307,21 @@ def execute_command(action: dict, context: dict) -> dict:
     return result
 
 
+def _normalize_file_content(content: Any) -> str:
+    if not isinstance(content, str):
+        return json.dumps(content, ensure_ascii=False, indent=2)
+
+    normalized = content
+    # Caso frecuente: el LLM devuelve texto doble-escapado ("\\n" literal)
+    # y termina escribiéndose en una sola línea.
+    if "\\n" in normalized and "\n" not in normalized:
+        normalized = normalized.replace("\\r\\n", "\n").replace("\\n", "\n")
+    if "\\t" in normalized and "\t" not in normalized:
+        normalized = normalized.replace("\\t", "\t")
+
+    return normalized
+
+
 def write_file(action: dict, context: dict) -> dict:
     state: AgentState | None = context.get("state")
     workspace = Path(context["workspace"]).resolve()
@@ -316,9 +331,7 @@ def write_file(action: dict, context: dict) -> dict:
     path = _safe_join(base, action["path"], context)
     path.parent.mkdir(parents=True, exist_ok=True)
 
-    content = action.get("content", "")
-    if not isinstance(content, str):
-        content = json.dumps(content, ensure_ascii=False, indent=2)
+    content = _normalize_file_content(action.get("content", ""))
     path.write_text(content, encoding="utf-8")
     return {"ok": True, "path": str(path)}
 
@@ -331,9 +344,7 @@ def modify_file(action: dict, context: dict) -> dict:
     base = _resolve_base_dir(context)
     path = _safe_join(base, action["path"], context)
 
-    content = action.get("content", "")
-    if not isinstance(content, str):
-        content = json.dumps(content, ensure_ascii=False, indent=2)
+    content = _normalize_file_content(action.get("content", ""))
 
     if not path.exists():
         path.parent.mkdir(parents=True, exist_ok=True)
