@@ -18,6 +18,7 @@ from core.orchestrator import _build_task_workspace, _parse_angular_cli_version,
 from core.state_manager import AgentState
 from core import planner as planner_mod
 import core.agent as agent_mod
+import core.orchestrator as orch_mod
 from core.validator import validate_actions, ValidationError
 
 
@@ -437,6 +438,115 @@ export class AppComponent {}""",
         self.assertIn("ÁRBOL REAL DEL PROYECTO", captured["prompt"])
         self.assertIn("src/app/app.component.ts", captured["prompt"])
 
+
+
+    def test_run_quality_checks_skips_lint_without_target(self):
+        base = Path(tempfile.mkdtemp(prefix="sonny_quality_no_lint_"))
+        project = base / "proj"
+        project.mkdir(parents=True, exist_ok=True)
+        (project / "angular.json").write_text('{"projects":{"app":{"architect":{}}}}', encoding="utf-8")
+
+        called_commands: list[str] = []
+        original = orch_mod._run_cmd_utf8
+        orch_mod._run_cmd_utf8 = lambda cmd, cwd=None, timeout=30: (called_commands.append(cmd) or (0, "ok"))
+        try:
+            failures, reports = orch_mod._run_quality_checks(project)
+        finally:
+            orch_mod._run_cmd_utf8 = original
+
+        self.assertEqual(failures, [])
+        self.assertEqual(len(reports), 3)
+        self.assertNotIn("ng lint", called_commands)
+
+    def test_run_quality_checks_includes_lint_with_target(self):
+        base = Path(tempfile.mkdtemp(prefix="sonny_quality_with_lint_"))
+        project = base / "proj"
+        project.mkdir(parents=True, exist_ok=True)
+        (project / "angular.json").write_text('{"projects":{"app":{"architect":{"lint":{}}}}}', encoding="utf-8")
+
+        called_commands: list[str] = []
+        original = orch_mod._run_cmd_utf8
+        orch_mod._run_cmd_utf8 = lambda cmd, cwd=None, timeout=30: (called_commands.append(cmd) or (0, "ok"))
+        try:
+            failures, reports = orch_mod._run_quality_checks(project)
+        finally:
+            orch_mod._run_cmd_utf8 = original
+
+        self.assertEqual(failures, [])
+        self.assertEqual(len(reports), 4)
+        self.assertIn("ng lint", called_commands)
+
+    def test_autofix_context_accumulates_quality_failures(self):
+        base = Path(tempfile.mkdtemp(prefix="sonny_autofix_ctx_"))
+        task = base / "task"
+        project = task / "proj"
+        (project / "src" / "app").mkdir(parents=True, exist_ok=True)
+        (project / "angular.json").write_text('{"projects":{"app":{"architect":{}}}}', encoding="utf-8")
+
+        captured_contexts: list[dict] = []
+        round_counter = {"n": 0}
+
+        original_build_task = orch_mod._build_task_workspace
+        original_detect_cli = orch_mod.detect_angular_cli_version
+        original_detect_env = orch_mod.detect_node_npm_os
+        original_ensure = orch_mod._ensure_angular_project_initialized
+        original_get_master = orch_mod.get_master_plan
+        original_get_actions = orch_mod.get_phase_actions
+        original_quality = orch_mod._run_quality_checks
+        original_autofix = orch_mod._autofix_with_llm
+
+        orch_mod._build_task_workspace = lambda user_request, workspace=None: task
+        orch_mod.detect_angular_cli_version = lambda: "21.1.5"
+        orch_mod.detect_node_npm_os = lambda: {"node": "v20", "npm": "10", "os": "Linux"}
+
+        def fake_ensure(task_workspace, state, user_request):
+            state.set_project_root(project)
+            state.angular_project_version = "21.1.5"
+
+        orch_mod._ensure_angular_project_initialized = fake_ensure
+        orch_mod.get_master_plan = lambda user_request, preferred_site=None: {
+            "phases": [{"name": "Desarrollo de componentes", "description": "x", "depends_on": []}]
+        }
+        orch_mod.get_phase_actions = lambda phase_name, context, preferred_site=None: {
+            "actions": [{"type": "file_write", "path": "src/app/app.component.ts", "content": "export class AppComponent {}"}]
+        }
+
+        def fake_quality(project_root):
+            round_counter["n"] += 1
+            if round_counter["n"] == 1:
+                f = [{"command": "ng build --configuration production", "exit_code": 1, "ok": False, "type": "build", "output": "e1"}]
+                return f, f
+            if round_counter["n"] == 2:
+                f = [{"command": "ng test --no-watch --browsers=ChromeHeadless", "exit_code": 1, "ok": False, "type": "test", "output": "e2"}]
+                return f, f
+            return [], [{"command": "ok", "exit_code": 0, "ok": True, "type": "x", "output": ""}]
+
+        orch_mod._run_quality_checks = fake_quality
+
+        def fake_autofix(fix_context, executor, state, preferred_site):
+            captured_contexts.append(fix_context)
+            return []
+
+        orch_mod._autofix_with_llm = fake_autofix
+
+        try:
+            result = orch_mod.run_orchestrator("demo request")
+        finally:
+            orch_mod._build_task_workspace = original_build_task
+            orch_mod.detect_angular_cli_version = original_detect_cli
+            orch_mod.detect_node_npm_os = original_detect_env
+            orch_mod._ensure_angular_project_initialized = original_ensure
+            orch_mod.get_master_plan = original_get_master
+            orch_mod.get_phase_actions = original_get_actions
+            orch_mod._run_quality_checks = original_quality
+            orch_mod._autofix_with_llm = original_autofix
+
+        self.assertTrue(result["ok"])
+        self.assertEqual(len(captured_contexts), 2)
+        self.assertEqual(len(captured_contexts[0]["accumulated_quality_failures"]), 1)
+        self.assertEqual(len(captured_contexts[1]["accumulated_quality_failures"]), 2)
+        self.assertIn("ng build --configuration production", captured_contexts[1]["forbidden_commands"])
+        self.assertIn("ng test --no-watch --browsers=ChromeHeadless", captured_contexts[1]["forbidden_commands"])
 
     def test_nested_actions_do_not_increment_phase_action_count(self):
         base = Path(tempfile.mkdtemp(prefix="sonny_nested_count_"))
