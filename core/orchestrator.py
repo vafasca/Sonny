@@ -401,7 +401,8 @@ def _build_angular_rules(project_structure: str, project_version: str) -> list[s
 
     rules += [
         "Usa ng build --configuration production (NO --prod).",
-        "ng lint requiere target lint (si falta, primero instala/configura angular-eslint).",
+        "Ejecuta ng lint solo si angular.json define el target lint.",
+        "Ejecuta ng e2e solo si angular.json define un target e2e.",
     ]
     return rules
 
@@ -559,6 +560,24 @@ def run_orchestrator(
                     for f in accumulated_quality_failures
                     if f.get("exit_code") != 0 and str(f.get("command", "")).strip()
                 ]))
+                forbidden_commands = [
+                    "ng serve",
+                    "npm start",
+                    "npm run start",
+                    *blocked_quality_commands,
+                ]
+                filtered_valid_commands = []
+                for cmd in list(context.get("valid_commands", []) or []):
+                    normalized = str(cmd).strip()
+                    is_blocked = any(
+                        normalized == blocked
+                        or normalized.startswith(f"{blocked} ")
+                        or blocked.startswith(f"{normalized} ")
+                        for blocked in forbidden_commands
+                    )
+                    if not is_blocked:
+                        filtered_valid_commands.append(cmd)
+
                 fix_context = {
                     **context,
                     "phase": {
@@ -569,12 +588,8 @@ def run_orchestrator(
                     "failed_checks": failures,
                     "accumulated_quality_failures": accumulated_quality_failures[-20:],
                     "errores_compilacion": failures,
-                    "forbidden_commands": [
-                        "ng serve",
-                        "npm start",
-                        "npm run start",
-                        *blocked_quality_commands,
-                    ],
+                    "forbidden_commands": forbidden_commands,
+                    "valid_commands": filtered_valid_commands,
                     "action_history": state.action_history[-20:],
                     "failed_actions": _failed_action_summaries(state),
                 }

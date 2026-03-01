@@ -596,6 +596,14 @@ export class AppComponent {}""",
         self.assertEqual(len(captured_contexts[1]["accumulated_quality_failures"]), 2)
         self.assertIn("ng build --configuration production", captured_contexts[1]["forbidden_commands"])
         self.assertIn("ng test --no-watch --browsers=ChromeHeadless", captured_contexts[1]["forbidden_commands"])
+        self.assertTrue(all(
+            "ng build --configuration production" not in cmd
+            for cmd in captured_contexts[1]["valid_commands"]
+        ))
+        self.assertTrue(all(
+            "ng test --no-watch --browsers=ChromeHeadless" not in cmd
+            for cmd in captured_contexts[1]["valid_commands"]
+        ))
 
     def test_nested_actions_do_not_increment_phase_action_count(self):
         base = Path(tempfile.mkdtemp(prefix="sonny_nested_count_"))
