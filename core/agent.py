@@ -82,7 +82,6 @@ def _resolve_base_dir(context: dict) -> Path:
     state: AgentState | None = context.get("state")
     workspace = Path(context["workspace"]).resolve()
     task_workspace = _state_workspace(state, workspace)
-
     base = Path(state.current_workdir).resolve() if state and state.current_workdir else task_workspace
     return _ensure_inside_workspace(base, task_workspace)
 
@@ -90,7 +89,6 @@ def _resolve_base_dir(context: dict) -> Path:
 def _safe_join(base: Path, rel_path: str, context: dict) -> Path:
     if not rel_path or not isinstance(rel_path, str):
         raise ExecutorError("Ruta relativa inválida.")
-
     target = Path(rel_path)
     if target.is_absolute():
         raise ExecutorError(f"No se permiten rutas absolutas: {rel_path}")
@@ -102,10 +100,28 @@ def _safe_join(base: Path, rel_path: str, context: dict) -> Path:
 
 
 def _find_angular_root(task_workspace: Path) -> Path | None:
-    candidates = sorted(task_workspace.rglob("angular.json"), key=lambda p: len(p.parts))
-    if not candidates:
+    angular_files = list(task_workspace.rglob("angular.json"))
+    if not angular_files:
         return None
-    return candidates[0].parent.resolve()
+    # Política explícita: elegir el angular.json más reciente.
+    angular_files.sort(key=lambda p: p.stat().st_mtime, reverse=True)
+    return angular_files[0].parent.resolve()
+
+
+def _extract_angular_project_version(project_root: Path | None) -> str:
+    if not project_root:
+        return "unknown"
+    package_file = project_root / "package.json"
+    if not package_file.exists():
+        return "unknown"
+    try:
+        data = json.loads(package_file.read_text(encoding="utf-8", errors="replace"))
+    except Exception:
+        return "unknown"
+
+    deps = {**data.get("dependencies", {}), **data.get("devDependencies", {})}
+    version = str(deps.get("@angular/core", "")).strip()
+    return version or "unknown"
 
 
 def _sync_state_with_disk(state: AgentState | None, workspace: Path) -> None:
@@ -129,6 +145,7 @@ def _sync_state_with_disk(state: AgentState | None, workspace: Path) -> None:
     detected = _find_angular_root(task_ws)
     if detected:
         state.set_project_root(detected)
+        state.angular_project_version = _extract_angular_project_version(detected)
 
 
 def _extract_cd_target(cmd: str) -> str | None:
@@ -143,6 +160,17 @@ def _extract_ng_new_target(cmd: str) -> str | None:
     return m.group(1) if m else None
 
 
+def _validate_lint_target(cmd: str, cwd: Path) -> None:
+    if not re.match(r"^\s*ng\s+lint\b", cmd, flags=re.IGNORECASE):
+        return
+    angular_file = cwd / "angular.json"
+    if not angular_file.exists():
+        raise ExecutorError("ng lint bloqueado: angular.json no existe en el directorio actual.")
+    content = angular_file.read_text(encoding="utf-8", errors="replace")
+    if '"lint"' not in content:
+        raise ExecutorError("ng lint bloqueado: el target lint no está definido en angular.json.")
+
+
 def _guard_angular_command(cmd: str, cwd: Path, state: AgentState | None, workspace: Path) -> Path:
     if not re.match(r"^\s*ng\b", cmd, flags=re.IGNORECASE):
         return cwd
@@ -151,10 +179,13 @@ def _guard_angular_command(cmd: str, cwd: Path, state: AgentState | None, worksp
         return cwd
 
     if (cwd / "angular.json").exists():
+        _validate_lint_target(cmd, cwd)
         return cwd
 
     if state and state.project_root and (Path(state.project_root) / "angular.json").exists():
-        return _ensure_inside_workspace(Path(state.project_root).resolve(), _state_workspace(state, workspace))
+        fixed = _ensure_inside_workspace(Path(state.project_root).resolve(), _state_workspace(state, workspace))
+        _validate_lint_target(cmd, fixed)
+        return fixed
 
     raise ExecutorError(
         "Comando Angular bloqueado: no hay angular.json en el directorio actual ni project_root detectado."
@@ -172,7 +203,6 @@ def execute_command(action: dict, context: dict) -> dict:
 
     ng_new_target = _extract_ng_new_target(cmd)
     if state and ng_new_target:
-        # actualización inmediata optimista; se valida luego con filesystem
         optimistic = _safe_join(cwd, ng_new_target, context)
         state.set_project_root(optimistic)
 
@@ -183,6 +213,8 @@ def execute_command(action: dict, context: dict) -> dict:
         capture_output=True,
         text=True,
         timeout=TIMEOUT_CMD,
+        encoding="utf-8",
+        errors="replace",
     )
     output = (proc.stdout or "") + ("\n" + proc.stderr if proc.stderr else "")
 
@@ -198,6 +230,7 @@ def execute_command(action: dict, context: dict) -> dict:
         detected = _find_angular_root(_state_workspace(state, workspace))
         if detected:
             state.set_project_root(detected)
+            state.angular_project_version = _extract_angular_project_version(detected)
             created_project_root = str(detected)
 
     result = {"ok": proc.returncode == 0, "returncode": proc.returncode, "output": output.strip()}
@@ -233,12 +266,20 @@ def modify_file(action: dict, context: dict) -> dict:
 
     base = _resolve_base_dir(context)
     path = _safe_join(base, action["path"], context)
-    if not path.exists():
-        raise ExecutorError(f"No existe archivo para modificar: {action['path']}")
 
     content = action.get("content", "")
     if not isinstance(content, str):
         content = json.dumps(content, ensure_ascii=False, indent=2)
+
+    if not path.exists():
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(content, encoding="utf-8")
+        return {
+            "ok": True,
+            "path": str(path),
+            "warning": f"file_modify fallback a file_write: archivo no existía ({action['path']})",
+        }
+
     path.write_text(content, encoding="utf-8")
     return {"ok": True, "path": str(path)}
 

@@ -9,7 +9,7 @@ sys.stderr.reconfigure(line_buffering=True)
 
 from core.ai           import interpret, test_providers, active_provider
 from core.agent        import run_agent, es_tarea_agente
-from core.orchestrator import run_orchestrator_with_site, detectar_navegadores
+from core.orchestrator import run_orchestrator_with_site, detectar_navegadores, detect_angular_cli_version
 from core.loop_guard import LoopGuardError
 from core.validator import ValidationError
 from core.planner import PlannerError
@@ -119,6 +119,30 @@ def _ask_preferred_ai(last_choice: str | None = None) -> str | None:
     return default_choice
 
 
+
+
+def _extract_angular_version_hint(user_input: str) -> str | None:
+    import re
+    m = re.search(r"angular\s*(?:v|version)?\s*(\d+(?:\.\d+){0,2})", (user_input or "").lower())
+    return m.group(1) if m else None
+
+
+def _ask_angular_version_if_needed(user_input: str) -> str:
+    hinted = _extract_angular_version_hint(user_input)
+    if hinted:
+        return hinted
+
+    detected = detect_angular_cli_version()
+    if detected not in {"not_installed", "unknown"}:
+        print(f"  {C.DIM}Angular CLI detectado: {detected}{C.RESET}")
+        return detected
+
+    print(f"  {C.YELLOW}⚠️ No detecté Angular CLI instalado automáticamente.{C.RESET}")
+    while True:
+        raw = input(f"{C.CYAN}tú > Especifica versión Angular objetivo (ej: 17.3.8): {C.RESET}").strip()
+        if raw:
+            return raw
+
 def _extract_preferred_ai(user_input: str) -> str | None:
     low = (user_input or "").lower()
     if "chatgpt" in low or "chat gpt" in low or "gpt" in low:
@@ -182,8 +206,10 @@ def main():
                     preferred_ai = _ask_preferred_ai(preferred_ai_memory)
                 preferred_ai_memory = preferred_ai
                 print(f"  {C.DIM}IA seleccionada: {preferred_ai}{C.RESET}")
+                angular_hint = _ask_angular_version_if_needed(user_input)
+                print(f"  {C.DIM}Angular objetivo: {angular_hint}{C.RESET}")
                 try:
-                    run_orchestrator_with_site(user_input, preferred_site=preferred_ai)
+                    run_orchestrator_with_site(user_input, preferred_site=preferred_ai, angular_cli_version_hint=angular_hint)
                 except LoopGuardError as exc:
                     print(f"  {C.RED}❌ Ejecución detenida por loop_guard:{C.RESET} {exc}")
                     print(f"  {C.DIM}Tip: pide menos archivos por fase o más comandos de build/test entre escrituras.{C.RESET}")

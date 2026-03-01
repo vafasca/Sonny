@@ -20,6 +20,8 @@ class AgentState:
     task_workspace: Path | None = None
     current_workdir: Path | None = None
     project_root: Path | None = None
+    angular_cli_version: str = "unknown"
+    angular_project_version: str = "unknown"
 
     def set_phase(self, phase_name: str) -> None:
         if self.current_phase == phase_name:
