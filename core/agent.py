@@ -14,11 +14,13 @@ from typing import Any
 from core.action_registry import ALLOWED_ACTIONS
 from core.ai_scraper import call_llm
 from core.state_manager import AgentState
+from core.validator import validate_actions, ValidationError
 from core.web_log import log_action_blocked, log_error
 
 WORKSPACE_ROOT = Path(__file__).parent.parent / "workspace"
 WORKSPACE_ROOT.mkdir(parents=True, exist_ok=True)
 TIMEOUT_CMD = 120
+MAX_NESTED_LLM_CALLS = 2
 
 TRIGGERS_AGENTE = [
     "desarrolla", "crea", "construye", "programa", "escribe",
@@ -40,6 +42,9 @@ class ActionExecutor:
         self.workspace = (workspace or WORKSPACE_ROOT).resolve()
 
     def execute_actions(self, actions_payload: dict, state: AgentState) -> list[dict[str, Any]]:
+        return self._execute_actions(actions_payload, state, nested_depth=0)
+
+    def _execute_actions(self, actions_payload: dict, state: AgentState, nested_depth: int) -> list[dict[str, Any]]:
         actions = actions_payload.get("actions", [])
         results: list[dict[str, Any]] = []
 
@@ -53,6 +58,24 @@ class ActionExecutor:
                 result = handler(action, {"workspace": self.workspace, "state": state})
                 if not isinstance(result, dict):
                     result = {"ok": True, "output": str(result)}
+
+                if action_type == "llm_call":
+                    nested_payload = _parse_nested_actions_payload(result.get("response", ""))
+                    if nested_payload:
+                        if nested_depth >= MAX_NESTED_LLM_CALLS:
+                            raise ExecutorError(
+                                f"Se alcanzó max_nested_calls={MAX_NESTED_LLM_CALLS} para llm_call."
+                            )
+                        validate_actions(nested_payload)
+                        nested_results = self._execute_actions(nested_payload, state, nested_depth=nested_depth + 1)
+                        result["nested_actions_executed"] = len(nested_payload.get("actions", []))
+                        result["nested_results"] = nested_results
+                        if any(not r.get("ok", False) for r in nested_results):
+                            raise ExecutorError("Fallaron acciones anidadas devueltas por llm_call.")
+            except (ValidationError, ExecutorError) as exc:
+                log_action_blocked(action_type or "unknown", str(exc))
+                log_error("executor", f"Acción bloqueada/fallida ({action_type}): {exc}")
+                result = {"ok": False, "error": str(exc)}
             except Exception as exc:
                 log_action_blocked(action_type or "unknown", str(exc))
                 log_error("executor", f"Acción bloqueada/fallida ({action_type}): {exc}")
@@ -62,6 +85,31 @@ class ActionExecutor:
             results.append(result)
 
         return results
+
+
+def _parse_nested_actions_payload(raw: str) -> dict | None:
+    if not isinstance(raw, str):
+        return None
+
+    text = raw.strip()
+    if not text:
+        return None
+
+    candidates = [text]
+    start = text.find("{")
+    end = text.rfind("}")
+    if start != -1 and end != -1 and end > start:
+        candidates.append(text[start:end + 1])
+
+    for candidate in candidates:
+        try:
+            payload = json.loads(candidate)
+        except Exception:
+            continue
+        if isinstance(payload, dict) and isinstance(payload.get("actions"), list):
+            return payload
+
+    return None
 
 
 def _state_workspace(state: AgentState | None, fallback: Path) -> Path:

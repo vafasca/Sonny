@@ -27,6 +27,16 @@ PROTECTED_FILES = {
     "index.html",
 }
 
+PLACEHOLDER_HINTS = (
+    "este archivo",
+    "se encargará",
+    "contendrá",
+    "placeholder",
+    "todo:",
+    "por implementar",
+    "pendiente",
+)
+
 
 def validate_plan(plan: dict) -> None:
     phases = plan.get("phases")
@@ -149,6 +159,7 @@ def validate_actions(actions_payload: dict) -> None:
         if action_type in {"file_write", "file_modify"}:
             path = action.get("path", "")
             _validate_path(path)
+            _validate_file_content(path, action.get("content", ""))
 
 
 def _validate_command(command: str) -> None:
@@ -175,3 +186,38 @@ def _validate_path(path: str) -> None:
     is_top_level = "/" not in cleaned
     if is_top_level and normalized in PROTECTED_FILES:
         raise ValidationError(f"Archivo protegido bloqueado: '{path}'.")
+
+
+def _validate_file_content(path: str, content: str) -> None:
+    if not isinstance(content, str):
+        raise ValidationError(f"Contenido inválido para '{path}': debe ser string.")
+
+    lowered = content.lower()
+    if any(hint in lowered for hint in PLACEHOLDER_HINTS):
+        raise ValidationError(f"Contenido placeholder detectado en '{path}'.")
+
+    ext = path.lower().split('.')[-1] if '.' in path else ''
+    stripped = content.strip()
+    if not stripped:
+        raise ValidationError(f"Contenido vacío detectado en '{path}'.")
+
+    if ext in {"ts", "tsx", "js", "jsx"}:
+        body = re.sub(r"/\*.*?\*/", "", stripped, flags=re.DOTALL)
+        body = re.sub(r"^\s*//.*$", "", body, flags=re.MULTILINE).strip()
+        if not body:
+            raise ValidationError(f"Contenido no sustantivo (solo comentarios) en '{path}'.")
+        code_tokens = ("import ", "export ", "@component", "class ", "function ", "const ", "let ", "=>")
+        if not any(token in body.lower() for token in code_tokens):
+            raise ValidationError(f"Contenido TypeScript/JavaScript sospechoso en '{path}'.")
+
+    if ext in {"html", "htm"}:
+        body = re.sub(r"<!--.*?-->", "", stripped, flags=re.DOTALL).strip()
+        if not body:
+            raise ValidationError(f"Contenido no sustantivo (solo comentarios) en '{path}'.")
+        if not re.search(r"<\s*[a-zA-Z][^>]*>", body):
+            raise ValidationError(f"HTML inválido o vacío en '{path}'.")
+
+    if ext in {"scss", "css"}:
+        body = re.sub(r"/\*.*?\*/", "", stripped, flags=re.DOTALL).strip()
+        if not re.search(r"[^{}]+\{[^{}]+\}", body):
+            raise ValidationError(f"CSS/SCSS sin reglas válidas en '{path}'.")

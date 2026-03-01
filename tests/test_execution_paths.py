@@ -12,10 +12,11 @@ ai_scraper_stub.set_preferred_site = lambda site: None
 ai_scraper_stub.available_sites = lambda: ["chatgpt", "claude", "gemini", "qwen"]
 sys.modules["core.ai_scraper"] = ai_scraper_stub
 
-from core.agent import ExecutorError, execute_command, modify_file, write_file, _block_interactive_commands
+from core.agent import ExecutorError, execute_command, modify_file, write_file, _block_interactive_commands, ActionExecutor
 from core.orchestrator import _build_task_workspace, _parse_angular_cli_version, _snapshot_project_files, _strip_ansi, _build_angular_rules, _validate_action_consistency, _sanitize_project_name
 from core.state_manager import AgentState
 from core import planner as planner_mod
+import core.agent as agent_mod
 from core.validator import validate_actions, ValidationError
 
 
@@ -178,7 +179,7 @@ Package Manager   : npm 11.10.1
     def test_validator_allows_nested_app_config(self):
         payload = {
             "actions": [
-                {"type": "file_write", "path": "src/app/app.config.ts", "content": "x"}
+                {"type": "file_write", "path": "src/app/app.config.ts", "content": "export const appConfig = {};"}
             ]
         }
         validate_actions(payload)
@@ -198,6 +199,70 @@ Package Manager   : npm 11.10.1
 
     def test_sanitize_project_name_keeps_ng_constraints(self):
         self.assertEqual(_sanitize_project_name("123__Hospital App!!!"), "app-123-hospital-app")
+
+    def test_validator_blocks_placeholder_typescript_content(self):
+        payload = {
+            "actions": [
+                {
+                    "type": "file_write",
+                    "path": "src/app/contact.component.ts",
+                    "content": "// Este archivo se encargará del formulario de contacto",
+                }
+            ]
+        }
+        with self.assertRaises(ValidationError):
+            validate_actions(payload)
+
+    def test_validator_blocks_placeholder_html_content(self):
+        payload = {
+            "actions": [
+                {
+                    "type": "file_write",
+                    "path": "src/app/app.component.html",
+                    "content": "<!-- Este archivo contendrá el HTML básico -->",
+                }
+            ]
+        }
+        with self.assertRaises(ValidationError):
+            validate_actions(payload)
+
+    def test_llm_call_executes_nested_actions(self):
+        base = Path(tempfile.mkdtemp(prefix="sonny_nested_llm_"))
+        task = base / "task_nested"
+        task.mkdir(parents=True, exist_ok=True)
+
+        state = AgentState()
+        state.set_task_workspace(task)
+
+        original = agent_mod.call_llm
+        agent_mod.call_llm = lambda prompt: '{"actions":[{"type":"file_write","path":"src/app/nested.service.ts","content":"export const nested = true;"}]}'
+        try:
+            executor = ActionExecutor(workspace=task)
+            results = executor.execute_actions({"actions": [{"type": "llm_call", "prompt": "hazlo"}]}, state)
+        finally:
+            agent_mod.call_llm = original
+
+        self.assertTrue((task / "src" / "app" / "nested.service.ts").exists())
+        self.assertEqual(results[0].get("nested_actions_executed"), 1)
+
+    def test_llm_call_nested_depth_limit(self):
+        base = Path(tempfile.mkdtemp(prefix="sonny_nested_depth_"))
+        task = base / "task_nested_depth"
+        task.mkdir(parents=True, exist_ok=True)
+
+        state = AgentState()
+        state.set_task_workspace(task)
+
+        original = agent_mod.call_llm
+        agent_mod.call_llm = lambda prompt: '{"actions":[{"type":"llm_call","prompt":"again"}]}'
+        try:
+            executor = ActionExecutor(workspace=task)
+            results = executor.execute_actions({"actions": [{"type": "llm_call", "prompt": "start"}]}, state)
+        finally:
+            agent_mod.call_llm = original
+
+        self.assertFalse(results[0]["ok"])
+        self.assertIn("anidadas", results[0]["error"])
 
     def test_task_workspace_isolation_unique_folders(self):
         a = _build_task_workspace("desarrolla una landing", None)
