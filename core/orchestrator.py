@@ -16,6 +16,7 @@ from pathlib import Path
 from core.agent import ActionExecutor
 from core.loop_guard import LoopGuard, LoopGuardError
 from core.planner import PlannerError, get_master_plan, get_phase_actions
+from core.ai_scraper import available_sites, set_preferred_site
 from core.state_manager import AgentState
 from core.validator import ValidationError, validate_actions, validate_plan
 from core.web_log import (
@@ -54,13 +55,17 @@ def _sort_phases(plan: dict) -> list[dict]:
     return ordered
 
 
-def run_orchestrator(user_request: str, workspace: Path | None = None) -> dict:
+def run_orchestrator(
+    user_request: str,
+    workspace: Path | None = None,
+    preferred_site: str | None = None,
+) -> dict:
     state = AgentState()
     executor = ActionExecutor(workspace=workspace)
 
     master_plan: dict | None = None
     for _ in range(2):
-        master_plan = get_master_plan(user_request)
+        master_plan = get_master_plan(user_request, preferred_site=preferred_site)
         try:
             validate_plan(master_plan)
             break
@@ -88,7 +93,7 @@ def run_orchestrator(user_request: str, workspace: Path | None = None) -> dict:
         }
 
         try:
-            actions_payload = get_phase_actions(phase_name, context)
+            actions_payload = get_phase_actions(phase_name, context, preferred_site=preferred_site)
             validate_actions(actions_payload)
         except ValidationError as exc:
             log_validation_failed(f"acciones:{phase_name}", str(exc))
@@ -127,5 +132,27 @@ def detectar_navegadores():
     return []
 
 
-def run_orchestrator_with_site(user_request: str, _preferred_site: str | None = None):
-    return run_orchestrator(user_request)
+def _extract_site_from_request(user_request: str) -> str | None:
+    low = (user_request or "").lower()
+    aliases = {
+        "claude": "claude",
+        "chatgpt": "chatgpt",
+        "chat gpt": "chatgpt",
+        "gpt": "chatgpt",
+        "gemini": "gemini",
+        "qwen": "qwen",
+    }
+    for token, key in aliases.items():
+        if token in low:
+            return key
+    return None
+
+
+def run_orchestrator_with_site(user_request: str, preferred_site: str | None = None):
+    selected = preferred_site or _extract_site_from_request(user_request)
+    if selected and selected in available_sites():
+        set_preferred_site(selected)
+    else:
+        selected = None
+        set_preferred_site(None)
+    return run_orchestrator(user_request, preferred_site=selected)

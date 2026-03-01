@@ -19,6 +19,25 @@ _PERSISTENT_SESSIONS: dict[str, BrowserSession] = {}
 _RUNTIME_LOOP: asyncio.AbstractEventLoop | None = None
 _RUNTIME_THREAD: threading.Thread | None = None
 _RUNTIME_LOCK = threading.Lock()
+_PREFERRED_SITE: str | None = None
+
+
+def set_preferred_site(site_key: str | None) -> None:
+    """Define preferencia global de proveedor para call_llm()."""
+    global _PREFERRED_SITE
+    if site_key is None:
+        _PREFERRED_SITE = None
+        return
+    site = site_key.strip().lower()
+    _PREFERRED_SITE = site if site in AI_SITES else None
+
+
+def get_preferred_site() -> str | None:
+    return _PREFERRED_SITE
+
+
+def available_sites() -> list[str]:
+    return list(AI_SITES.keys())
 
 
 def _ensure_runtime_loop() -> asyncio.AbstractEventLoop:
@@ -103,8 +122,12 @@ async def _call_llm_async(prompt: str, preferred_site: Optional[str] = None, obj
 
 def call_llm(prompt: str) -> str:
     """Envía un prompt y devuelve texto crudo del LLM."""
+    preferred = get_preferred_site()
     loop = _ensure_runtime_loop()
-    future = asyncio.run_coroutine_threadsafe(_call_llm_async(prompt, objetivo=prompt), loop)
+    future = asyncio.run_coroutine_threadsafe(
+        _call_llm_async(prompt, preferred_site=preferred, objetivo=prompt),
+        loop,
+    )
     return future.result()
 
 

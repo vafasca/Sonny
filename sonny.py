@@ -84,6 +84,19 @@ def banner():
 
 CMDS_SALIR = {"salir","exit","quit","chau","bye"}
 
+
+def _extract_preferred_ai(user_input: str) -> str | None:
+    low = (user_input or "").lower()
+    if "chatgpt" in low or "chat gpt" in low or "gpt" in low:
+        return "chatgpt"
+    if "claude" in low:
+        return "claude"
+    if "gemini" in low:
+        return "gemini"
+    if "qwen" in low:
+        return "qwen"
+    return None
+
 def main():
     banner()
     pendiente  = None
@@ -129,7 +142,10 @@ def main():
             if (is_web_task or needs_framework) and not modo_fuzzy:
                 if needs_framework and not is_web_task:
                     print(f"  {C.DIM}Framework detectado — usando orquestador web{C.RESET}")
-                run_orchestrator_with_site(user_input)
+                preferred_ai = _extract_preferred_ai(user_input)
+                if preferred_ai:
+                    print(f"  {C.DIM}IA seleccionada: {preferred_ai}{C.RESET}")
+                run_orchestrator_with_site(user_input, preferred_site=preferred_ai)
                 continue
 
             if es_tarea_agente(user_input) and not modo_fuzzy:

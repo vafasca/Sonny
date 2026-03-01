@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import json
-from core.ai_scraper import call_llm
+from core.ai_scraper import call_llm, get_preferred_site, set_preferred_site
 
 MAX_RETRIES = 3
 
@@ -24,7 +24,7 @@ def _extract_json(raw: str) -> dict:
         raise
 
 
-def _ask_json(prompt: str) -> dict:
+def _ask_json(prompt: str, preferred_site: str | None = None) -> dict:
     last_error = ""
     strict_prompt = (
         f"{prompt}\n\n"
@@ -32,7 +32,14 @@ def _ask_json(prompt: str) -> dict:
     )
 
     for _ in range(MAX_RETRIES):
-        raw = call_llm(strict_prompt)
+        current = get_preferred_site()
+        if preferred_site is not None:
+            set_preferred_site(preferred_site)
+        try:
+            raw = call_llm(strict_prompt)
+        finally:
+            if preferred_site is not None:
+                set_preferred_site(current)
         try:
             return _extract_json(raw)
         except Exception as exc:
@@ -45,7 +52,7 @@ def _ask_json(prompt: str) -> dict:
     raise PlannerError(f"No se pudo obtener JSON válido del LLM tras {MAX_RETRIES} intentos: {last_error}")
 
 
-def get_master_plan(user_request: str) -> dict:
+def get_master_plan(user_request: str, preferred_site: str | None = None) -> dict:
     prompt = (
         "Genera un plan maestro para ejecutar la solicitud del usuario.\n"
         "Formato obligatorio:\n"
@@ -56,10 +63,10 @@ def get_master_plan(user_request: str) -> dict:
         "}\n"
         f"Solicitud del usuario: {user_request}"
     )
-    return _ask_json(prompt)
+    return _ask_json(prompt, preferred_site=preferred_site)
 
 
-def get_phase_actions(phase_name: str, context: dict) -> dict:
+def get_phase_actions(phase_name: str, context: dict, preferred_site: str | None = None) -> dict:
     prompt = (
         f"Genera acciones para la fase '{phase_name}'.\n"
         "Formato obligatorio:\n"
@@ -73,4 +80,4 @@ def get_phase_actions(phase_name: str, context: dict) -> dict:
         "}\n"
         f"Contexto: {json.dumps(context, ensure_ascii=False)}"
     )
-    return _ask_json(prompt)
+    return _ask_json(prompt, preferred_site=preferred_site)
