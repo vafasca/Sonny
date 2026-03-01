@@ -162,6 +162,19 @@ Package Manager   : npm 11.10.1
         self.assertTrue(any("NO NgModules" in r or "standalone" in r.lower() for r in standalone))
         self.assertTrue(any("app.module.ts" in r for r in ngmodules))
 
+    def test_validator_accepts_phase_short_dependencies(self):
+        from core.validator import validate_plan
+
+        plan = {
+            "phases": [
+                {"name": "Fase 1: Planificación y Diseño", "description": "a", "depends_on": []},
+                {"name": "Fase 2: Configuración", "description": "b", "depends_on": ["Fase 1"]},
+                {"name": "Fase 3: Desarrollo", "description": "c", "depends_on": ["Fase 2"]},
+            ]
+        }
+
+        validate_plan(plan)
+
     def test_validator_allows_nested_app_config(self):
         payload = {
             "actions": [

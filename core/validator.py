@@ -34,6 +34,8 @@ def validate_plan(plan: dict) -> None:
         raise ValidationError("El plan está vacío o no contiene fases válidas.")
 
     seen_names: set[str] = set()
+    normalized_names: set[str] = set()
+    aliases: dict[str, str] = {}
     graph: dict[str, list[str]] = defaultdict(list)
 
     for phase in phases:
@@ -49,6 +51,15 @@ def validate_plan(plan: dict) -> None:
             raise ValidationError(f"Fase duplicada detectada: '{name}'.")
         seen_names.add(name)
 
+        normalized_name = _normalize_phase_ref(name)
+        if normalized_name in normalized_names:
+            raise ValidationError(f"Fase ambigua detectada por normalización: '{name}'.")
+        normalized_names.add(normalized_name)
+
+        short_ref = _extract_phase_short_ref(name)
+        if short_ref:
+            aliases[short_ref] = name
+
         deps = phase.get("depends_on") or []
         if not isinstance(deps, list):
             raise ValidationError(f"depends_on debe ser lista en fase '{name}'.")
@@ -56,12 +67,46 @@ def validate_plan(plan: dict) -> None:
         for dep in deps:
             graph[name].append(dep)
 
+    resolved_graph: dict[str, list[str]] = defaultdict(list)
+
     for name, deps in graph.items():
         for dep in deps:
-            if dep not in seen_names:
+            resolved_dep = _resolve_phase_dependency(dep, seen_names, aliases)
+            if resolved_dep is None:
                 raise ValidationError(f"Dependencia desconocida '{dep}' en fase '{name}'.")
+            resolved_graph[name].append(resolved_dep)
 
-    _assert_acyclic(graph)
+    _assert_acyclic(resolved_graph)
+
+
+def _normalize_phase_ref(value: str) -> str:
+    return re.sub(r"\s+", " ", (value or "").strip()).casefold()
+
+
+def _extract_phase_short_ref(name: str) -> str | None:
+    normalized = re.sub(r"\s+", " ", name.strip())
+    # Permite que `depends_on: ["Fase 1"]` haga match con
+    # `name: "Fase 1: Configuración ..."`.
+    match = re.match(r"^(fase|phase)\s+(\d+)(?=\s*[:\-–—]|\s*$)", normalized, flags=re.IGNORECASE)
+    if not match:
+        return None
+    return f"{match.group(1).casefold()} {match.group(2)}"
+
+
+def _resolve_phase_dependency(dep: str, names: set[str], aliases: dict[str, str]) -> str | None:
+    if dep in names:
+        return dep
+
+    normalized_dep = _normalize_phase_ref(dep)
+    by_normalized = { _normalize_phase_ref(name): name for name in names }
+    if normalized_dep in by_normalized:
+        return by_normalized[normalized_dep]
+
+    short_dep = _extract_phase_short_ref(dep)
+    if short_dep and short_dep in aliases:
+        return aliases[short_dep]
+
+    return None
 
 
 def _assert_acyclic(graph: dict[str, list[str]]) -> None:
