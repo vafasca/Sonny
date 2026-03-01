@@ -11,6 +11,8 @@ Flujo:
 from __future__ import annotations
 
 from collections import deque
+from datetime import datetime
+import re
 from pathlib import Path
 
 from core.agent import ActionExecutor
@@ -60,13 +62,36 @@ def _sort_phases(plan: dict) -> list[dict]:
     return ordered
 
 
+
+
+def _slugify_request(text: str) -> str:
+    cleaned = re.sub(r"[^a-zA-Z0-9]+", "_", (text or "task").strip().lower()).strip("_")
+    return cleaned[:48] or "task"
+
+
+def _build_task_workspace(user_request: str, workspace: Path | None) -> Path:
+    if workspace is not None:
+        root = Path(workspace)
+        root.mkdir(parents=True, exist_ok=True)
+        return root
+
+    base = Path(__file__).parent.parent / "workspace"
+    base.mkdir(parents=True, exist_ok=True)
+    task_dir = base / f"{_slugify_request(user_request)}_{datetime.now().strftime('%H%M%S')}"
+    task_dir.mkdir(parents=True, exist_ok=True)
+    return task_dir
+
+
 def run_orchestrator(
     user_request: str,
     workspace: Path | None = None,
     preferred_site: str | None = None,
 ) -> dict:
+    task_workspace = _build_task_workspace(user_request, workspace)
     state = AgentState()
-    executor = ActionExecutor(workspace=workspace)
+    state.set_task_workspace(task_workspace)
+    executor = ActionExecutor(workspace=task_workspace)
+    print(f"  {C.DIM}Workspace de tarea: {task_workspace}{C.RESET}")
 
     master_plan: dict | None = None
     for _ in range(2):
@@ -96,6 +121,9 @@ def run_orchestrator(
             "phase": phase,
             "completed_phases": state.completed_phases,
             "action_history": state.action_history[-10:],
+            "task_workspace": str(state.task_workspace) if state.task_workspace else "",
+            "current_workdir": str(state.current_workdir) if state.current_workdir else "",
+            "project_root": str(state.project_root) if state.project_root else "",
         }
 
         try:
@@ -120,7 +148,7 @@ def run_orchestrator(
             LoopGuard.check(state)
             state.complete_phase(phase_name)
             state.reset_phase()
-            phase_results.append({"phase": phase_name, "results": results})
+            phase_results.append({"phase": phase_name, "results": results, "cwd": str(state.current_workdir or task_workspace), "project_root": str(state.project_root) if state.project_root else ""})
             log_phase_event(phase_name, "completed", f"actions={len(results)}")
         except LoopGuardError as exc:
             log_loop_detected(phase_name, str(exc))
@@ -135,6 +163,8 @@ def run_orchestrator(
         "completed_phases": state.completed_phases,
         "iterations": state.iteration_count,
         "phase_results": phase_results,
+        "task_workspace": str(task_workspace),
+        "project_root": str(state.project_root) if state.project_root else "",
     }
 
 

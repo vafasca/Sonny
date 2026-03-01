@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from pathlib import Path
 from collections import Counter
 from typing import Any
 
@@ -16,6 +17,9 @@ class AgentState:
     tool_usage_count: Counter = field(default_factory=Counter)
     phase_action_count: int = 0
     phase_repetition_count: Counter = field(default_factory=Counter)
+    task_workspace: Path | None = None
+    current_workdir: Path | None = None
+    project_root: Path | None = None
 
     def set_phase(self, phase_name: str) -> None:
         if self.current_phase == phase_name:
@@ -46,3 +50,17 @@ class AgentState:
 
     def reset_phase(self) -> None:
         self.phase_action_count = 0
+
+
+    
+
+    def set_task_workspace(self, path: Path) -> None:
+        self.task_workspace = Path(path)
+        self.current_workdir = Path(path)
+
+    def set_current_workdir(self, path: Path) -> None:
+        self.current_workdir = Path(path)
+
+    def set_project_root(self, path: Path) -> None:
+        self.project_root = Path(path)
+        self.current_workdir = Path(path)

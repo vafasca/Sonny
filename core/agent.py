@@ -6,6 +6,7 @@ Este módulo NO planifica. Solo ejecuta acciones validadas.
 from __future__ import annotations
 
 import json
+import re
 import subprocess
 from pathlib import Path
 from typing import Any
@@ -71,9 +72,33 @@ class ActionExecutor:
         return results
 
 
+
+
+def _resolve_base_dir(context: dict) -> Path:
+    state: AgentState | None = context.get("state")
+    if state and state.current_workdir:
+        return Path(state.current_workdir)
+    return Path(context["workspace"])
+
+
+def _extract_cd_target(cmd: str) -> str | None:
+    m = re.match(r"^\s*cd\s+([^&;]+)", cmd.strip(), flags=re.IGNORECASE)
+    if not m:
+        return None
+    return m.group(1).strip().strip('"').strip("'")
+
+
+def _detect_created_project_dir(cmd: str, base_dir: Path) -> Path | None:
+    m = re.search(r"\bng\s+new\s+([\w\-.]+)", cmd, flags=re.IGNORECASE)
+    if not m:
+        return None
+    candidate = (base_dir / m.group(1)).resolve()
+    return candidate if candidate.exists() else None
+
+
 def execute_command(action: dict, context: dict) -> dict:
     cmd = action["command"]
-    workspace = Path(context["workspace"])
+    workspace = _resolve_base_dir(context)
     proc = subprocess.run(
         cmd,
         shell=True,
@@ -83,11 +108,35 @@ def execute_command(action: dict, context: dict) -> dict:
         timeout=TIMEOUT_CMD,
     )
     output = (proc.stdout or "") + ("\n" + proc.stderr if proc.stderr else "")
-    return {"ok": proc.returncode == 0, "returncode": proc.returncode, "output": output.strip()}
+
+    state: AgentState | None = context.get("state")
+    created: Path | None = None
+    if state and proc.returncode == 0:
+        created = _detect_created_project_dir(cmd, workspace)
+        if created:
+            state.set_project_root(created)
+        elif (workspace / "angular.json").exists():
+            state.set_project_root(workspace)
+        cd_target = _extract_cd_target(cmd)
+        if cd_target:
+            next_dir = Path(cd_target)
+            if not next_dir.is_absolute():
+                next_dir = (workspace / next_dir).resolve()
+            if next_dir.exists() and next_dir.is_dir():
+                state.set_current_workdir(next_dir)
+
+    result = {"ok": proc.returncode == 0, "returncode": proc.returncode, "output": output.strip()}
+    if state:
+        result["cwd"] = str(state.current_workdir or workspace)
+        if state.project_root:
+            result["project_root"] = str(state.project_root)
+        if created:
+            result["created_project_root"] = str(created)
+    return result
 
 
 def write_file(action: dict, context: dict) -> dict:
-    workspace = Path(context["workspace"])
+    workspace = _resolve_base_dir(context)
     path = workspace / action["path"]
     path.parent.mkdir(parents=True, exist_ok=True)
     content = action.get("content", "")
@@ -98,7 +147,7 @@ def write_file(action: dict, context: dict) -> dict:
 
 
 def modify_file(action: dict, context: dict) -> dict:
-    workspace = Path(context["workspace"])
+    workspace = _resolve_base_dir(context)
     path = workspace / action["path"]
     if not path.exists():
         raise ExecutorError(f"No existe archivo para modificar: {action['path']}")
