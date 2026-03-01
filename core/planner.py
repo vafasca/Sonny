@@ -217,7 +217,21 @@ def get_phase_actions(phase_name: str, context: dict, preferred_site: str | None
         "- El executor resolverá rutas absolutas de forma segura.\n"
         "- Si archivo no existe, usa file_write en vez de file_modify.\n"
         "- No uses ng serve/npm start en modo automático.\n"
+        "\nREGLAS CRÍTICAS PARA EL CAMPO \"content\":\n"
+        "- SIEMPRE debe contener código fuente COMPLETO listo para escribirse en disco.\n"
+        "- Si es .scss → selectores CSS reales. Ejemplo: body { margin: 0; }\n"
+        "- Si es .ts   → código TypeScript Angular compilable.\n"
+        "- Si es .html → markup HTML/Angular válido.\n"
+        "- Si es .md   → texto y markdown libremente.\n"
+        "\nPROHIBIDO en \"content\" para .scss, .ts y .html:\n"
+        "- Texto descriptivo (\"Agregar X, hacer Y...\").\n"
+        "- Instrucciones en lenguaje natural.\n"
+        "- Comentarios sin código real.\n"
+        "\n❌ MAL: \"content\": \"Agregar focus-visible a botones...\"\n"
+        "✅ BIEN: \"content\": \":focus-visible { outline: 3px solid #667EEA; }\"\n"
     )
+
+
 
     prompt = (
         f"Genera acciones para la fase '{phase_name}'.\n"

@@ -191,6 +191,8 @@ Package Manager   : npm 11.10.1
         self.assertIn("ARCHIVOS QUE EXISTEN", captured["prompt"])
         self.assertIn("COMANDOS VÁLIDOS", captured["prompt"])
         self.assertNotIn("Contexto JSON:", captured["prompt"])
+        self.assertIn('REGLAS CRÍTICAS PARA EL CAMPO "content"', captured["prompt"])
+        self.assertIn('PROHIBIDO en "content" para .scss, .ts y .html', captured["prompt"])
         self.assertEqual(payload["actions"][0]["type"], "llm_call")
 
 
