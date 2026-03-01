@@ -247,4 +247,22 @@ def get_phase_actions(phase_name: str, context: dict, preferred_site: str | None
         f"{project_block}\n"
         f"{exec_rules}"
     )
+
+    forbidden = _dedupe_keep_order(list(context.get("forbidden_commands", []) or []), 30)
+    if forbidden:
+        prompt += (
+            "\n\nCOMANDOS PROHIBIDOS (NO los uses bajo ninguna circunstancia):\n"
+            + "\n".join(f"• {c}" for c in forbidden)
+        )
+
+    accum = list(context.get("accumulated_quality_failures", []) or [])
+    if accum:
+        prompt += (
+            "\n\nFALLOS ACUMULADOS EN RONDAS ANTERIORES DE CALIDAD:\n"
+            + "\n".join(
+                f"• {f.get('command', '?')} → exit {f.get('exit_code', '?')}: {str(f.get('output', ''))[:120]}"
+                for f in accum
+            )
+        )
+
     return _ask_json(prompt, preferred_site=preferred_site)

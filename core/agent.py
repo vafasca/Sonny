@@ -14,6 +14,7 @@ from typing import Any
 from core.action_registry import ALLOWED_ACTIONS
 from core.ai_scraper import call_llm
 from core.state_manager import AgentState
+from core.loop_guard import LoopGuard, LoopGuardError
 from core.validator import validate_actions, ValidationError
 from core.web_log import log_action_blocked, log_error
 
@@ -23,6 +24,7 @@ TIMEOUT_CMD = 120
 MAX_NESTED_LLM_CALLS = 2
 MAX_CONTEXT_FILE_BYTES = 3000
 MAX_CONTEXT_FILES = 8
+MAX_CONTEXT_TOTAL_BYTES = 12000
 
 TRIGGERS_AGENTE = [
     "desarrolla", "crea", "construye", "programa", "escribe",
@@ -83,8 +85,14 @@ class ActionExecutor:
                 log_error("executor", f"Acción bloqueada/fallida ({action_type}): {exc}")
                 result = {"ok": False, "error": str(exc)}
 
-            state.register_action(action, result)
+            is_root_action = nested_depth == 0
+            state.register_action(action, result, count_for_phase=is_root_action)
             results.append(result)
+
+            try:
+                LoopGuard.check(state)
+            except LoopGuardError as exc:
+                raise ExecutorError(str(exc)) from exc
 
         return results
 
@@ -124,43 +132,38 @@ def _collect_project_file_context(prompt: str, state: AgentState | None) -> str:
 
     low = (prompt or "").lower()
 
-    keyword_map: list[tuple[tuple[str, ...], list[str]]] = [
+    keyword_map: list[tuple[tuple[str, ...], tuple[str, ...]]] = [
         (
             ("html", "formulario", "form", "accesibilidad", "aria", "label", "input", "reemplazar"),
-            [
-                "src/app/contact/contact.component.html",
-                "src/app/hero/hero.component.html",
-                "src/app/services/services.component.html",
-                "src/app/team/team.component.html",
-                "src/app/app.component.html",
-                "src/app/app.html",
-            ],
+            (".html",),
         ),
         (
             ("scss", "css", "estilo", "color", "variable", "tipografía", "margin", "padding", "consistencia"),
-            [
-                "src/styles.scss",
-                "src/app/app.scss",
-                "src/app/contact/contact.component.scss",
-                "src/app/hero/hero.component.scss",
-            ],
+            (".scss", ".css"),
         ),
         (
             ("ts", "typescript", "componente", "import", "standalone", "service", "compilación", "error"),
-            [
-                "src/app/app.component.ts",
-                "src/app/app.ts",
-                "src/app/app.config.ts",
-                "src/app/app.routes.ts",
-                "src/app/contact/contact.component.ts",
-            ],
+            (".ts",),
         ),
     ]
 
-    candidate_rel_paths: list[str] = []
-    for keywords, rel_paths in keyword_map:
+    selected_exts: set[str] = set()
+    for keywords, exts in keyword_map:
         if any(kw in low for kw in keywords):
-            candidate_rel_paths.extend(rel_paths)
+            selected_exts.update(exts)
+
+    candidate_rel_paths: list[str] = []
+    if selected_exts:
+        for file in sorted(project_root.rglob("*")):
+            if not file.is_file():
+                continue
+            if file.suffix.lower() not in selected_exts:
+                continue
+            try:
+                rel = file.relative_to(project_root)
+            except ValueError:
+                continue
+            candidate_rel_paths.append(str(rel).replace("\\", "/"))
 
     # Si el prompt menciona rutas explícitas, priorizarlas.
     explicit_paths = re.findall(r"(?:src/[\w\-./]+\.(?:ts|html|scss|css|md))", prompt or "", flags=re.IGNORECASE)
@@ -178,6 +181,7 @@ def _collect_project_file_context(prompt: str, state: AgentState | None) -> str:
             break
 
     blocks: list[str] = []
+    total_context_bytes = 0
     for rel in selected:
         full = (project_root / rel).resolve()
         try:
@@ -185,8 +189,19 @@ def _collect_project_file_context(prompt: str, state: AgentState | None) -> str:
                 continue
             if project_root not in full.parents and full != project_root:
                 continue
-            content = full.read_text(encoding="utf-8", errors="replace")[:MAX_CONTEXT_FILE_BYTES]
+
+            full_text = full.read_text(encoding="utf-8", errors="replace")
+            allowed_for_file = min(MAX_CONTEXT_FILE_BYTES, MAX_CONTEXT_TOTAL_BYTES - total_context_bytes)
+            if allowed_for_file <= 0:
+                break
+
+            content = full_text[:allowed_for_file]
+            consumed = len(content)
+            if consumed <= 0:
+                continue
+
             blocks.append(f"[ARCHIVO REAL EN DISCO: {rel}]\n```\n{content}\n```")
+            total_context_bytes += consumed
         except Exception:
             continue
 

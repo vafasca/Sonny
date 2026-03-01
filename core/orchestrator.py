@@ -282,6 +282,22 @@ def _sync_state_before_phase(state: AgentState, task_workspace: Path) -> None:
         state.angular_project_version = _angular_project_version(project)
 
 
+def _project_has_lint_target(project_root: Path | None) -> bool:
+    if not project_root:
+        return False
+
+    angular_file = Path(project_root) / "angular.json"
+    if not angular_file.exists():
+        return False
+
+    try:
+        content = angular_file.read_text(encoding="utf-8", errors="replace")
+    except Exception:
+        return False
+
+    return '"lint"' in content
+
+
 def _phase_generates_code(actions_payload: dict) -> bool:
     actions = actions_payload.get("actions", [])
     for action in actions:
@@ -298,10 +314,11 @@ def _phase_generates_code(actions_payload: dict) -> bool:
 def _run_quality_checks(project_root: Path) -> tuple[list[dict], list[dict]]:
     checks = [
         ("ng build --configuration production", "Prueba de Compilación (AOT)", 300),
-        ("ng lint", "Análisis Estático", 120),
         ("ng test --no-watch --browsers=ChromeHeadless", "Pruebas Unitarias", 300),
         ("ng e2e", "Pruebas de Extremo a Extremo", 300),
     ]
+    if _project_has_lint_target(project_root):
+        checks.insert(1, ("ng lint", "Análisis Estático", 120))
 
     failures: list[dict] = []
     reports: list[dict] = []
@@ -384,7 +401,8 @@ def _build_angular_rules(project_structure: str, project_version: str) -> list[s
 
     rules += [
         "Usa ng build --configuration production (NO --prod).",
-        "ng lint requiere target lint (si falta, primero instala/configura angular-eslint).",
+        "Ejecuta ng lint solo si angular.json define el target lint.",
+        "Ejecuta ng e2e solo si angular.json define un target e2e.",
     ]
     return rules
 
@@ -462,7 +480,7 @@ def run_orchestrator(
             "valid_commands": [
                 "ng build --configuration production (NO --prod)",
                 "ng test --no-watch --browsers=ChromeHeadless",
-                "ng lint (requiere angular-eslint)",
+                *(["ng lint (requiere angular-eslint)"] if _project_has_lint_target(state.project_root) else []),
                 "ng e2e",
             ],
             "deprecated_commands": ["ng build --prod"],
@@ -513,8 +531,10 @@ def run_orchestrator(
         if state.project_root and _phase_generates_code(actions_payload):
             print(f"  {C.CYAN}▶ Verificando calidad tras fase: {phase_name}{C.RESET}")
             max_fix_rounds = 3
+            accumulated_quality_failures: list[dict] = []
             for round_num in range(1, max_fix_rounds + 1):
                 failures, reports = _run_quality_checks(Path(state.project_root))
+                accumulated_quality_failures.extend(failures)
                 _print_checklist(reports, round_num)
 
                 phase_results.append(
@@ -535,6 +555,29 @@ def run_orchestrator(
                     break
 
                 print(f"  {C.YELLOW}⚠️ Corrigiendo errores detectados ({len(failures)}) con LLM...{C.RESET}")
+                blocked_quality_commands = list(dict.fromkeys([
+                    str(f.get("command", "")).strip()
+                    for f in accumulated_quality_failures
+                    if f.get("exit_code") != 0 and str(f.get("command", "")).strip()
+                ]))
+                forbidden_commands = [
+                    "ng serve",
+                    "npm start",
+                    "npm run start",
+                    *blocked_quality_commands,
+                ]
+                filtered_valid_commands = []
+                for cmd in list(context.get("valid_commands", []) or []):
+                    normalized = str(cmd).strip()
+                    is_blocked = any(
+                        normalized == blocked
+                        or normalized.startswith(f"{blocked} ")
+                        or blocked.startswith(f"{normalized} ")
+                        for blocked in forbidden_commands
+                    )
+                    if not is_blocked:
+                        filtered_valid_commands.append(cmd)
+
                 fix_context = {
                     **context,
                     "phase": {
@@ -543,8 +586,10 @@ def run_orchestrator(
                         "depends_on": [phase_name],
                     },
                     "failed_checks": failures,
+                    "accumulated_quality_failures": accumulated_quality_failures[-20:],
                     "errores_compilacion": failures,
-                    "forbidden_commands": ["ng serve", "npm start", "npm run start"],
+                    "forbidden_commands": forbidden_commands,
+                    "valid_commands": filtered_valid_commands,
                     "action_history": state.action_history[-20:],
                     "failed_actions": _failed_action_summaries(state),
                 }
