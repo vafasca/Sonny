@@ -13,7 +13,7 @@ ai_scraper_stub.available_sites = lambda: ["chatgpt", "claude", "gemini", "qwen"
 sys.modules["core.ai_scraper"] = ai_scraper_stub
 
 from core.agent import ExecutorError, execute_command, modify_file, write_file
-from core.orchestrator import _build_task_workspace
+from core.orchestrator import _build_task_workspace, _parse_angular_cli_version
 from core.state_manager import AgentState
 
 
@@ -87,6 +87,17 @@ class TestExecutionPaths(unittest.TestCase):
 
         with self.assertRaises(ExecutorError):
             execute_command({"type": "command", "command": "ng lint"}, {"workspace": task, "state": state})
+
+
+    def test_parse_angular_cli_version_variants(self):
+        sample = """
+Angular CLI       : 21.1.5
+Node.js           : 20.19.0
+Package Manager   : npm 11.10.1
+"""
+        self.assertEqual(_parse_angular_cli_version(sample), "21.1.5")
+        self.assertEqual(_parse_angular_cli_version("Angular CLI 19.2.3"), "19.2.3")
+        self.assertEqual(_parse_angular_cli_version("random output"), "unknown")
 
     def test_task_workspace_isolation_unique_folders(self):
         a = _build_task_workspace("desarrolla una landing", None)

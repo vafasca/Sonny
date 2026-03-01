@@ -39,16 +39,46 @@ def _run_cmd_utf8(cmd: str, cwd: Path | None = None) -> tuple[int, str]:
     return proc.returncode, out.strip()
 
 
-def detect_angular_cli_version() -> str:
-    code, out = _run_cmd_utf8("ng version --no-interactive")
-    if code != 0:
-        return "not_installed"
+def _parse_angular_cli_version(output: str) -> str:
+    txt = (output or "").strip()
+    if not txt:
+        return "unknown"
 
-    for line in out.splitlines():
+    # Formato típico: "Angular CLI       : 21.1.5"
+    for line in txt.splitlines():
         low = line.lower()
         if "angular cli" in low and ":" in line:
-            return line.split(":", 1)[1].strip()
+            return line.split(":", 1)[1].strip() or "unknown"
+
+    # Fallback defensivo: intentar capturar "Angular CLI 21.1.5"
+    m = re.search(r"angular\s+cli\s*:?\s*v?(\d+(?:\.\d+){1,3})", txt, flags=re.IGNORECASE)
+    if m:
+        return m.group(1)
+
     return "unknown"
+
+
+def detect_angular_cli_version() -> str:
+    attempts = [
+        "ng version --no-interactive",
+        "ng version",
+        "ng v",
+    ]
+
+    saw_any_output = False
+    for cmd in attempts:
+        code, out = _run_cmd_utf8(cmd)
+        if out:
+            saw_any_output = True
+            parsed = _parse_angular_cli_version(out)
+            if parsed != "unknown":
+                return parsed
+
+        # si el comando ejecutó y respondió pero no parseó, intentar siguiente variante
+        if code == 0 and out:
+            continue
+
+    return "unknown" if saw_any_output else "not_installed"
 
 
 def detect_node_npm_os() -> dict[str, str]:
