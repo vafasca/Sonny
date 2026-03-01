@@ -155,6 +155,32 @@ def _extract_preferred_ai(user_input: str) -> str | None:
         return "qwen"
     return None
 
+
+
+def _run_web_orchestrator(user_input: str, preferred_ai_memory: str | None) -> str | None:
+    preferred_ai = _extract_preferred_ai(user_input)
+    if not preferred_ai:
+        preferred_ai = _ask_preferred_ai(preferred_ai_memory)
+    preferred_ai_memory = preferred_ai
+    print(f"  {C.DIM}IA seleccionada: {preferred_ai}{C.RESET}")
+
+    angular_hint = _ask_angular_version_if_needed(user_input)
+    print(f"  {C.DIM}Angular objetivo: {angular_hint}{C.RESET}")
+
+    try:
+        run_orchestrator_with_site(user_input, preferred_site=preferred_ai, angular_cli_version_hint=angular_hint)
+    except LoopGuardError as exc:
+        print(f"  {C.RED}❌ Ejecución detenida por loop_guard:{C.RESET} {exc}")
+        print(f"  {C.DIM}Tip: pide menos archivos por fase o más comandos de build/test entre escrituras.{C.RESET}")
+    except ValidationError as exc:
+        print(f"  {C.RED}❌ Validación bloqueó el plan/acciones:{C.RESET} {exc}")
+    except PlannerError as exc:
+        print(f"  {C.RED}❌ Planner no pudo obtener JSON válido:{C.RESET} {exc}")
+    except Exception as exc:
+        print(f"  {C.RED}❌ Error en orquestador:{C.RESET} {exc}")
+
+    return preferred_ai_memory
+
 def main():
     banner()
     pendiente  = None
@@ -201,28 +227,13 @@ def main():
             if (is_web_task or needs_framework) and not modo_fuzzy:
                 if needs_framework and not is_web_task:
                     print(f"  {C.DIM}Framework detectado — usando orquestador web{C.RESET}")
-                preferred_ai = _extract_preferred_ai(user_input)
-                if not preferred_ai:
-                    preferred_ai = _ask_preferred_ai(preferred_ai_memory)
-                preferred_ai_memory = preferred_ai
-                print(f"  {C.DIM}IA seleccionada: {preferred_ai}{C.RESET}")
-                angular_hint = _ask_angular_version_if_needed(user_input)
-                print(f"  {C.DIM}Angular objetivo: {angular_hint}{C.RESET}")
-                try:
-                    run_orchestrator_with_site(user_input, preferred_site=preferred_ai, angular_cli_version_hint=angular_hint)
-                except LoopGuardError as exc:
-                    print(f"  {C.RED}❌ Ejecución detenida por loop_guard:{C.RESET} {exc}")
-                    print(f"  {C.DIM}Tip: pide menos archivos por fase o más comandos de build/test entre escrituras.{C.RESET}")
-                except ValidationError as exc:
-                    print(f"  {C.RED}❌ Validación bloqueó el plan/acciones:{C.RESET} {exc}")
-                except PlannerError as exc:
-                    print(f"  {C.RED}❌ Planner no pudo obtener JSON válido:{C.RESET} {exc}")
-                except Exception as exc:
-                    print(f"  {C.RED}❌ Error en orquestador:{C.RESET} {exc}")
+                preferred_ai_memory = _run_web_orchestrator(user_input, preferred_ai_memory)
                 continue
 
             if es_tarea_agente(user_input) and not modo_fuzzy:
-                run_agent(user_input); continue
+                print(f"  {C.DIM}Tarea de desarrollo detectada — usando orquestador web{C.RESET}")
+                preferred_ai_memory = _run_web_orchestrator(user_input, preferred_ai_memory)
+                continue
 
             if not modo_fuzzy:
                 print(f"{C.DIM}  [interpretando...]{C.RESET}", end="\r")
