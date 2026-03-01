@@ -95,6 +95,26 @@ def log_session_end(objetivo: str, success: bool, total_rounds: int = 0, ng_majo
                    "total_rounds": total_rounds, "ng_major": ng_major})
 
 
+
+def log_validation_failed(scope: str, detail: str):
+    _append_txt(f"\n[{_ts()}]  ❌ VALIDACIÓN FALLIDA [{scope}]: {detail}\n")
+    _append_jsonl({"event": "validation_failed", "scope": scope, "detail": detail[:500]})
+
+
+def log_action_blocked(action_type: str, reason: str):
+    _append_txt(f"\n[{_ts()}]  ⛔ ACCIÓN BLOQUEADA [{action_type}]: {reason}\n")
+    _append_jsonl({"event": "action_blocked", "action_type": action_type, "reason": reason[:500]})
+
+
+def log_loop_detected(phase: str, detail: str):
+    _append_txt(f"\n[{_ts()}]  🔁 LOOP DETECTADO [{phase}]: {detail}\n")
+    _append_jsonl({"event": "loop_detected", "phase": phase, "detail": detail[:500]})
+
+
+def log_phase_event(phase: str, event: str, detail: str = ""):
+    _append_txt(f"\n[{_ts()}]  📦 FASE [{phase}] {event}: {detail}\n")
+    _append_jsonl({"event": "phase_event", "phase": phase, "phase_event": event, "detail": detail[:500]})
+
 # ─── Utilidades de análisis ───────────────────────────────────────────────────
 
 def query_sessions(event_type: str = None, last_n: int = 50) -> list:
