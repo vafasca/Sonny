@@ -85,6 +85,37 @@ def banner():
 CMDS_SALIR = {"salir","exit","quit","chau","bye"}
 
 
+AI_OPTIONS = ["chatgpt", "claude", "gemini", "qwen"]
+
+
+def _ask_preferred_ai(last_choice: str | None = None) -> str | None:
+    default_choice = last_choice if last_choice in AI_OPTIONS else "claude"
+    print(f"  {C.DIM}Elige IA web: chatgpt | claude | gemini | qwen (Enter={default_choice}){C.RESET}")
+    raw = input(f"{C.CYAN}tú > {C.RESET}").strip().lower()
+    if not raw:
+        return default_choice
+
+    normalized = raw.replace(" ", "")
+    aliases = {
+        "chatgpt": "chatgpt",
+        "chatgpt.": "chatgpt",
+        "chatgpt,": "chatgpt",
+        "chatgpt!": "chatgpt",
+        "gpt": "chatgpt",
+        "chatgpt4": "chatgpt",
+        "chatgpt-4": "chatgpt",
+        "claude": "claude",
+        "gemini": "gemini",
+        "qwen": "qwen",
+    }
+    selected = aliases.get(normalized)
+    if selected in AI_OPTIONS:
+        return selected
+
+    print(f"  {C.YELLOW}⚠️ IA no reconocida. Usando {default_choice}.{C.RESET}")
+    return default_choice
+
+
 def _extract_preferred_ai(user_input: str) -> str | None:
     low = (user_input or "").lower()
     if "chatgpt" in low or "chat gpt" in low or "gpt" in low:
@@ -100,6 +131,7 @@ def _extract_preferred_ai(user_input: str) -> str | None:
 def main():
     banner()
     pendiente  = None
+    preferred_ai_memory: str | None = None
     modo_fuzzy = not any(p.get("api_key") and "XXXX" not in p["api_key"] for p in PROVIDERS)
 
     while True:
@@ -143,8 +175,10 @@ def main():
                 if needs_framework and not is_web_task:
                     print(f"  {C.DIM}Framework detectado — usando orquestador web{C.RESET}")
                 preferred_ai = _extract_preferred_ai(user_input)
-                if preferred_ai:
-                    print(f"  {C.DIM}IA seleccionada: {preferred_ai}{C.RESET}")
+                if not preferred_ai:
+                    preferred_ai = _ask_preferred_ai(preferred_ai_memory)
+                preferred_ai_memory = preferred_ai
+                print(f"  {C.DIM}IA seleccionada: {preferred_ai}{C.RESET}")
                 run_orchestrator_with_site(user_input, preferred_site=preferred_ai)
                 continue
 
