@@ -145,10 +145,35 @@ Package Manager   : npm 11.10.1
             },
         )
         self.assertIn("CONTEXTO DEL PROYECTO ANGULAR", captured["prompt"])
+        self.assertEqual(captured["prompt"].count("CONTEXTO DEL PROYECTO ANGULAR"), 1)
         self.assertIn("ARCHIVOS QUE EXISTEN", captured["prompt"])
         self.assertIn("COMANDOS VÁLIDOS", captured["prompt"])
+        self.assertNotIn("Contexto JSON:", captured["prompt"])
         self.assertEqual(payload["actions"][0]["type"], "llm_call")
 
+
+    def test_planner_prompt_dedupes_repeated_project_lists(self):
+        captured = {"prompt": ""}
+
+        def fake_call(prompt: str) -> str:
+            captured["prompt"] = prompt
+            return '{"actions": [{"type": "llm_call", "prompt": "ok"}]}'
+
+        planner_mod.call_llm = fake_call
+        planner_mod.get_phase_actions(
+            "fase-dup",
+            {
+                "existing_files": ["src/app/app.ts", "src/app/app.ts"],
+                "missing_files": ["src/app/a.ts", "src/app/a.ts"],
+                "app_tree": ["src/app/app.ts", "src/app/app.ts"],
+                "valid_commands": ["ng build --configuration production", "ng build --configuration production"],
+                "deprecated_commands": ["ng build --prod", "ng build --prod"],
+                "angular_rules": ["Usa standalone", "Usa standalone"],
+            },
+        )
+
+        self.assertEqual(captured["prompt"].count("• src/app/app.ts"), 2)  # existing + app_tree
+        self.assertEqual(captured["prompt"].count("• ng build --configuration production"), 1)
 
     def test_strip_ansi_from_cli_output(self):
         raw = "\x1b[36mAngular CLI\x1b[39m : \x1b[33m21.1.5\x1b[39m"

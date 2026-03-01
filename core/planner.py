@@ -9,6 +9,19 @@ from core.ai_scraper import call_llm, get_preferred_site, set_preferred_site
 MAX_RETRIES = 3
 
 
+def _dedupe_keep_order(items: list[str], limit: int) -> list[str]:
+    seen = set()
+    out = []
+    for item in items:
+        if item in seen:
+            continue
+        seen.add(item)
+        out.append(item)
+        if len(out) >= limit:
+            break
+    return out
+
+
 def _extract_braced_json(text: str) -> str:
     start = text.find("{")
     end = text.rfind("}")
@@ -162,18 +175,19 @@ def get_master_plan(user_request: str, preferred_site: str | None = None) -> dic
 
 
 def get_phase_actions(phase_name: str, context: dict, preferred_site: str | None = None) -> dict:
-    existing = context.get("existing_files", [])
-    missing = context.get("missing_files", [])
-    app_tree = context.get("app_tree", [])
-    valid_commands = context.get("valid_commands", [])
-    deprecated = context.get("deprecated_commands", [])
-    angular_rules = context.get("angular_rules", [])
+    existing = _dedupe_keep_order(list(context.get("existing_files", []) or []), 40)
+    missing = _dedupe_keep_order(list(context.get("missing_files", []) or []), 40)
+    app_tree = _dedupe_keep_order(list(context.get("app_tree", []) or []), 80)
+    valid_commands = _dedupe_keep_order(list(context.get("valid_commands", []) or []), 20)
+    deprecated = _dedupe_keep_order(list(context.get("deprecated_commands", []) or []), 20)
+    angular_rules = _dedupe_keep_order(list(context.get("angular_rules", []) or []), 30)
     runtime = context.get("runtime_env", {})
 
+    divider = "─" * 70
     project_block = (
-        "\n" + "─" * 70 + "\n"
+        f"\n{divider}\n"
         "CONTEXTO DEL PROYECTO ANGULAR:\n"
-        "─" * 70 + "\n"
+        f"{divider}\n"
         f"Angular CLI global: {context.get('angular_cli_version', 'unknown')}\n"
         f"Angular del proyecto: {context.get('angular_project_version', 'unknown')}\n"
         f"Node: {runtime.get('node', 'unknown')} / npm: {runtime.get('npm', 'unknown')} / SO: {runtime.get('os', 'unknown')}\n"
@@ -182,18 +196,18 @@ def get_phase_actions(phase_name: str, context: dict, preferred_site: str | None
         f"Project root: {context.get('project_root', '')}\n"
         f"Current workdir: {context.get('current_workdir', '')}\n"
         "\nARCHIVOS QUE EXISTEN (puedes modificar):\n"
-        + "\n".join(f"• {f}" for f in existing[:40])
+        + "\n".join(f"• {f}" for f in existing)
         + "\n\nARCHIVOS QUE NO EXISTEN (NO intentes modificar, usa file_write):\n"
-        + "\n".join(f"• {f}" for f in missing[:40])
+        + "\n".join(f"• {f}" for f in missing)
         + "\n\nÁRBOL REAL src/app (escaneado):\n"
-        + ("\n".join(f"• {f}" for f in app_tree[:80]) if app_tree else "• (vacío/no detectado)")
+        + ("\n".join(f"• {f}" for f in app_tree) if app_tree else "• (vacío/no detectado)")
         + "\n\nCOMANDOS VÁLIDOS:\n"
         + "\n".join(f"• {c}" for c in valid_commands)
         + "\n\nCOMANDOS DEPRECADOS/NO USAR:\n"
         + "\n".join(f"• {c}" for c in deprecated)
         + "\n\nREGLAS ANGULAR:\n"
         + "\n".join(f"• {r}" for r in angular_rules)
-        + "\n" + "─" * 70 + "\n"
+        + f"\n{divider}\n"
     )
 
     exec_rules = (
@@ -216,7 +230,6 @@ def get_phase_actions(phase_name: str, context: dict, preferred_site: str | None
         '    {"type": "llm_call", "prompt": "..."}\n'
         "  ]\n"
         "}\n"
-        f"Contexto JSON: {json.dumps(context, ensure_ascii=False)}\n"
         f"{project_block}\n"
         f"{exec_rules}"
     )
