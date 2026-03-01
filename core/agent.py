@@ -5,6 +5,7 @@ Este módulo NO planifica. Solo ejecuta acciones validadas.
 
 from __future__ import annotations
 
+import json
 import subprocess
 from pathlib import Path
 from typing import Any
@@ -89,7 +90,10 @@ def write_file(action: dict, context: dict) -> dict:
     workspace = Path(context["workspace"])
     path = workspace / action["path"]
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(action.get("content", ""), encoding="utf-8")
+    content = action.get("content", "")
+    if not isinstance(content, str):
+        content = json.dumps(content, ensure_ascii=False, indent=2)
+    path.write_text(content, encoding="utf-8")
     return {"ok": True, "path": str(path)}
 
 
@@ -98,7 +102,10 @@ def modify_file(action: dict, context: dict) -> dict:
     path = workspace / action["path"]
     if not path.exists():
         raise ExecutorError(f"No existe archivo para modificar: {action['path']}")
-    path.write_text(action.get("content", ""), encoding="utf-8")
+    content = action.get("content", "")
+    if not isinstance(content, str):
+        content = json.dumps(content, ensure_ascii=False, indent=2)
+    path.write_text(content, encoding="utf-8")
     return {"ok": True, "path": str(path)}
 
 
