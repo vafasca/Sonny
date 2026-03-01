@@ -13,7 +13,7 @@ ai_scraper_stub.available_sites = lambda: ["chatgpt", "claude", "gemini", "qwen"
 sys.modules["core.ai_scraper"] = ai_scraper_stub
 
 from core.agent import ExecutorError, execute_command, modify_file, write_file, _block_interactive_commands, ActionExecutor
-from core.orchestrator import _build_task_workspace, _parse_angular_cli_version, _snapshot_project_files, _strip_ansi, _build_angular_rules, _validate_action_consistency, _sanitize_project_name
+from core.orchestrator import _build_task_workspace, _parse_angular_cli_version, _snapshot_project_files, _strip_ansi, _build_angular_rules, _validate_action_consistency, _sanitize_project_name, _build_ng_new_command
 from core.state_manager import AgentState
 from core import planner as planner_mod
 import core.agent as agent_mod
@@ -196,6 +196,14 @@ Package Manager   : npm 11.10.1
         }
         with self.assertRaises(ValidationError):
             _validate_action_consistency(payload, context)
+
+    def test_build_ng_new_command_fast_init_uses_skip_install(self):
+        cmd = _build_ng_new_command("hospital-landing", fast_init=True)
+        self.assertIn("--skip-install", cmd)
+
+    def test_build_ng_new_command_full_init_without_skip_install(self):
+        cmd = _build_ng_new_command("hospital-landing", fast_init=False)
+        self.assertNotIn("--skip-install", cmd)
 
     def test_sanitize_project_name_keeps_ng_constraints(self):
         self.assertEqual(_sanitize_project_name("123__Hospital App!!!"), "app-123-hospital-app")

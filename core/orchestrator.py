@@ -5,6 +5,7 @@ from __future__ import annotations
 from collections import deque
 from datetime import datetime
 import json
+import os
 import platform
 import re
 import subprocess
@@ -136,6 +137,24 @@ def _sanitize_project_name(seed: str) -> str:
     return base[:40].rstrip("-") or "hospital-landing"
 
 
+
+
+def _build_ng_new_command(project_name: str, fast_init: bool = True) -> str:
+    parts = [
+        "ng",
+        "new",
+        project_name,
+        "--routing",
+        "--style=scss",
+        "--skip-git",
+        "--defaults",
+        "--interactive=false",
+    ]
+    if fast_init:
+        parts.append("--skip-install")
+    return " ".join(parts)
+
+
 def _ensure_angular_project_initialized(task_workspace: Path, state: AgentState, user_request: str) -> Path | None:
     existing_root = _find_angular_root(task_workspace)
     if existing_root:
@@ -152,9 +171,13 @@ def _ensure_angular_project_initialized(task_workspace: Path, state: AgentState,
         return None
 
     project_name = _sanitize_project_name(_slugify_request(user_request))
-    cmd = f"ng new {project_name} --routing --style=scss --skip-git --defaults --interactive=false"
+    # Por defecto hacemos init rápido para no bloquear UX en npm install largo.
+    fast_init = os.getenv("SONNY_ANGULAR_FAST_INIT", "1").strip().lower() not in {"0", "false", "no"}
+    cmd = _build_ng_new_command(project_name, fast_init=fast_init)
     print(f"  {C.CYAN}▶ Inicializando proyecto Angular base: {project_name}{C.RESET}")
-    code, out = _run_cmd_utf8(cmd, cwd=task_workspace, timeout=900)
+    if fast_init:
+        print(f"  {C.DIM}Init rápido activo (--skip-install). Puedes instalar deps luego con npm install.{C.RESET}")
+    code, out = _run_cmd_utf8(cmd, cwd=task_workspace, timeout=300 if fast_init else 900)
     if code != 0:
         raise RuntimeError(f"No se pudo inicializar proyecto Angular base con ng new: {out[-1000:]}")
 
