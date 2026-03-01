@@ -162,6 +162,16 @@ def get_master_plan(user_request: str, preferred_site: str | None = None) -> dic
 
 
 def get_phase_actions(phase_name: str, context: dict, preferred_site: str | None = None) -> dict:
+    exec_rules = (
+        "Reglas de ejecución:\n"
+        "- Usa rutas RELATIVAS lógicas al proyecto (ej: src/app/app.ts).\n"
+        "- NO uses rutas absolutas.\n"
+        "- El executor resolverá rutas absolutas de forma segura.\n"
+        "- Contexto de disco actual: "
+        f"task_workspace={context.get('task_workspace','')}, "
+        f"current_workdir={context.get('current_workdir','')}, "
+        f"project_root={context.get('project_root','')}."
+    )
     prompt = (
         f"Genera acciones para la fase '{phase_name}'.\n"
         "Formato obligatorio:\n"
@@ -173,6 +183,7 @@ def get_phase_actions(phase_name: str, context: dict, preferred_site: str | None
         '    {"type": "llm_call", "prompt": "..."}\n'
         "  ]\n"
         "}\n"
-        f"Contexto: {json.dumps(context, ensure_ascii=False)}"
+        f"Contexto: {json.dumps(context, ensure_ascii=False)}\n"
+        f"{exec_rules}"
     )
     return _ask_json(prompt, preferred_site=preferred_site)

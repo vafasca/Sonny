@@ -2,9 +2,9 @@
 
 from __future__ import annotations
 
+from collections import Counter
 from dataclasses import dataclass, field
 from pathlib import Path
-from collections import Counter
 from typing import Any
 
 
@@ -35,13 +35,7 @@ class AgentState:
 
     def register_action(self, action: dict[str, Any], result: dict[str, Any]) -> None:
         action_type = action.get("type", "unknown")
-        self.action_history.append(
-            {
-                "phase": self.current_phase,
-                "action": action,
-                "result": result,
-            }
-        )
+        self.action_history.append({"phase": self.current_phase, "action": action, "result": result})
         self.phase_action_count += 1
         self.tool_usage_count[action_type] += 1
 
@@ -51,16 +45,15 @@ class AgentState:
     def reset_phase(self) -> None:
         self.phase_action_count = 0
 
-
-    
-
     def set_task_workspace(self, path: Path) -> None:
-        self.task_workspace = Path(path)
-        self.current_workdir = Path(path)
+        workspace = Path(path).resolve()
+        self.task_workspace = workspace
+        self.current_workdir = workspace
 
     def set_current_workdir(self, path: Path) -> None:
-        self.current_workdir = Path(path)
+        self.current_workdir = Path(path).resolve()
 
     def set_project_root(self, path: Path) -> None:
-        self.project_root = Path(path)
-        self.current_workdir = Path(path)
+        project = Path(path).resolve()
+        self.project_root = project
+        self.current_workdir = project

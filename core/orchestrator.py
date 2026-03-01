@@ -77,7 +77,7 @@ def _build_task_workspace(user_request: str, workspace: Path | None) -> Path:
 
     base = Path(__file__).parent.parent / "workspace"
     base.mkdir(parents=True, exist_ok=True)
-    task_dir = base / f"{_slugify_request(user_request)}_{datetime.now().strftime('%H%M%S')}"
+    task_dir = base / f"{_slugify_request(user_request)}_{datetime.now().strftime('%H%M%S_%f')}"
     task_dir.mkdir(parents=True, exist_ok=True)
     return task_dir
 

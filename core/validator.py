@@ -121,6 +121,12 @@ def _validate_path(path: str) -> None:
     if not path or not isinstance(path, str):
         raise ValidationError("Acción de archivo sin path válido.")
 
-    normalized = path.replace("\\", "/").split("/")[-1].lower()
+    cleaned = path.replace("\\", "/")
+    if cleaned.startswith("/") or re.match(r"^[a-zA-Z]:/", cleaned):
+        raise ValidationError(f"Ruta absoluta no permitida: '{path}'.")
+    if ".." in cleaned.split("/"):
+        raise ValidationError(f"Path traversal bloqueado: '{path}'.")
+
+    normalized = cleaned.split("/")[-1].lower()
     if normalized in PROTECTED_FILES:
         raise ValidationError(f"Archivo protegido bloqueado: '{path}'.")
