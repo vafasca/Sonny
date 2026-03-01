@@ -14,6 +14,11 @@ from pathlib import Path
 from core.agent import ActionExecutor
 from core.loop_guard import LoopGuard, LoopGuardError
 from core.planner import PlannerError, get_master_plan, get_phase_actions
+from core.pipeline_config import (
+    MAX_ACTIONS_PER_PHASE,
+    MAX_LLM_CALLS_PER_PHASE,
+    REQUIRE_PRECHECK,
+)
 from core.ai_scraper import available_sites, set_preferred_site
 from core.state_manager import AgentState
 from core.validator import ValidationError, validate_actions, validate_plan
@@ -89,6 +94,161 @@ def detect_node_npm_os() -> dict[str, str]:
         "os": platform.system() or "unknown",
     }
 
+
+
+
+RIGID_PHASES = [
+    "FASE 1 — ESTRUCTURA ARQUITECTÓNICA",
+    "FASE 2 — IMPLEMENTACIÓN PROGRESIVA",
+    "FASE 3 — ACCESIBILIDAD Y SEO",
+    "FASE 4 — OPTIMIZACIÓN",
+    "FASE 5 — QUALITY CHECK FINAL",
+]
+
+
+def _normalize_phase_name(name: str) -> str:
+    return re.sub(r"\s+", " ", (name or "").strip().lower())
+
+
+def _is_rigid_phase(name: str, rigid_name: str) -> bool:
+    norm = _normalize_phase_name(name)
+    rigid = _normalize_phase_name(rigid_name)
+    return rigid in norm or norm in rigid
+
+
+def _enforce_rigid_pipeline(plan: dict) -> dict:
+    phases = list(plan.get("phases", []))
+    if not phases:
+        return {"phases": []}
+
+    selected = []
+    for rigid in RIGID_PHASES:
+        found = next((p for p in phases if _is_rigid_phase(p.get("name", ""), rigid)), None)
+        if found:
+            selected.append({
+                "name": rigid,
+                "description": found.get("description", rigid),
+                "depends_on": [selected[-1]["name"]] if selected else [],
+            })
+            continue
+        selected.append({
+            "name": rigid,
+            "description": rigid,
+            "depends_on": [selected[-1]["name"]] if selected else [],
+        })
+
+    return {"phases": selected}
+
+
+def _validate_phase_action_limits(actions_payload: dict, phase_name: str) -> None:
+    actions = list(actions_payload.get("actions", []))
+    if len(actions) > MAX_ACTIONS_PER_PHASE:
+        raise ValidationError(
+            f"La fase '{phase_name}' excede máximo de acciones ({MAX_ACTIONS_PER_PHASE})."
+        )
+
+    llm_calls = sum(1 for a in actions if a.get("type") == "llm_call")
+    if llm_calls > MAX_LLM_CALLS_PER_PHASE:
+        raise ValidationError(
+            f"La fase '{phase_name}' excede máximo de llm_call ({MAX_LLM_CALLS_PER_PHASE})."
+        )
+
+
+def _run_precheck_phase(
+    state: AgentState,
+    executor: ActionExecutor,
+    preferred_site: str | None,
+    runtime_env: dict[str, str],
+    phase_results: list[dict],
+) -> None:
+    if not REQUIRE_PRECHECK:
+        return
+
+    if not state.project_root:
+        raise RuntimeError("FASE 0 requiere project_root Angular detectado.")
+
+    project_root = Path(state.project_root)
+    required = ["angular.json", "package.json", "src/main.ts"]
+    missing = [rel for rel in required if not (project_root / rel).exists()]
+    if missing:
+        raise RuntimeError(f"FASE 0 abortada: faltan archivos obligatorios: {', '.join(missing)}")
+
+    state.set_phase("FASE 0 — PRE-CHECK")
+    precheck_actions = {
+        "actions": [
+            {"type": "command", "command": "npm install"},
+            {"type": "command", "command": "ng build"},
+        ]
+    }
+    results = executor.execute_actions(precheck_actions, state)
+    phase_results.append(
+        {
+            "phase": "FASE 0 — PRE-CHECK",
+            "results": results,
+            "cwd": str(state.current_workdir or project_root),
+            "project_root": str(project_root),
+        }
+    )
+
+    has_build_failure = any(
+        isinstance(r, dict) and r.get("ok") is False and "returncode" in r
+        for r in results[-1:]
+    )
+
+    if not has_build_failure:
+        state.complete_phase("FASE 0 — PRE-CHECK")
+        state.reset_phase()
+        return
+
+    fix_context = {
+        "user_request": "Autocorregir fallo de pre-check de build",
+        "phase": {"name": "Corrección FASE 0", "description": "Corrige build inicial.", "depends_on": []},
+        "completed_phases": state.completed_phases,
+        "action_history": state.action_history[-20:],
+        "failed_actions": _failed_action_summaries(state),
+        "errores_compilacion": [results[-1]],
+        "task_workspace": str(state.task_workspace) if state.task_workspace else "",
+        "current_workdir": str(state.current_workdir) if state.current_workdir else "",
+        "project_root": str(state.project_root),
+        "angular_cli_version": state.angular_cli_version,
+        "angular_project_version": state.angular_project_version,
+        "runtime_env": runtime_env,
+        "project_structure": _snapshot_project_files(Path(state.task_workspace), Path(state.project_root))["structure"],
+        "existing_files": _snapshot_project_files(Path(state.task_workspace), Path(state.project_root))["existing"],
+        "missing_files": _snapshot_project_files(Path(state.task_workspace), Path(state.project_root))["missing"],
+        "app_tree": _snapshot_project_files(Path(state.task_workspace), Path(state.project_root))["app_tree"],
+        "valid_commands": ["ng build", "npm install"],
+        "deprecated_commands": ["ng build --prod"],
+        "angular_rules": _build_angular_rules(
+            _snapshot_project_files(Path(state.task_workspace), Path(state.project_root))["structure"],
+            state.angular_project_version,
+        ),
+        "forbidden_commands": ["ng serve", "npm start", "npm run start"],
+    }
+    fix_results = _autofix_with_llm(fix_context, executor, state, preferred_site)
+    phase_results.append(
+        {
+            "phase": "quality_autofix_FASE_0",
+            "results": fix_results,
+            "cwd": str(state.current_workdir or project_root),
+            "project_root": str(project_root),
+        }
+    )
+
+    retry = executor.execute_actions({"actions": [{"type": "command", "command": "ng build"}]}, state)
+    phase_results.append(
+        {
+            "phase": "FASE 0 — PRE-CHECK retry",
+            "results": retry,
+            "cwd": str(state.current_workdir or project_root),
+            "project_root": str(project_root),
+        }
+    )
+    if not retry or retry[-1].get("ok") is not True:
+        raise RuntimeError("FASE 0 abortada: ng build sigue fallando tras autocorrección.")
+
+    state.complete_phase("FASE 0 — PRE-CHECK")
+    state.reset_phase()
 
 def _sort_phases(plan: dict) -> list[dict]:
     phases = plan.get("phases", [])
@@ -450,7 +610,11 @@ def run_orchestrator(
     else:
         raise PlannerError("No se pudo obtener un plan maestro estructuralmente válido.")
 
+    master_plan = _enforce_rigid_pipeline(master_plan)
+
     phase_results: list[dict] = []
+    _run_precheck_phase(state, executor, preferred_site, runtime_env, phase_results)
+
     ordered_phases = _sort_phases(master_plan)
     print(f"  {C.CYAN}Plan validado: {len(ordered_phases)} fase(s){C.RESET}")
 
@@ -478,6 +642,7 @@ def run_orchestrator(
             "missing_files": snap["missing"],
             "app_tree": snap["app_tree"],
             "valid_commands": [
+                "ng build",
                 "ng build --configuration production (NO --prod)",
                 "ng test --no-watch --browsers=ChromeHeadless",
                 *(["ng lint (requiere angular-eslint)"] if _project_has_lint_target(state.project_root) else []),
@@ -490,6 +655,7 @@ def run_orchestrator(
         try:
             actions_payload = get_phase_actions(phase_name, context, preferred_site=preferred_site)
             validate_actions(actions_payload)
+            _validate_phase_action_limits(actions_payload, phase_name)
             _validate_action_consistency(actions_payload, context)
         except ValidationError as exc:
             log_validation_failed(f"acciones:{phase_name}", str(exc))
@@ -528,7 +694,7 @@ def run_orchestrator(
             raise
 
         # Validación post-fase con auto-corrección (máx 3 intentos)
-        if state.project_root and _phase_generates_code(actions_payload):
+        if state.project_root and (_phase_generates_code(actions_payload) or "fase 5" in phase_name.lower()):
             print(f"  {C.CYAN}▶ Verificando calidad tras fase: {phase_name}{C.RESET}")
             max_fix_rounds = 3
             accumulated_quality_failures: list[dict] = []

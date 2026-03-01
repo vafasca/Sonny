@@ -1,0 +1,9 @@
+"""Configuración del pipeline incremental del orquestador."""
+
+from __future__ import annotations
+
+MAX_ACTIONS_PER_PHASE = 5
+MAX_LLM_CALLS_PER_PHASE = 1
+MAX_FILE_WRITES_WITHOUT_BUILD = 3
+REQUIRE_PRECHECK = True
+REQUIRE_BUILD_AFTER_PHASE = True

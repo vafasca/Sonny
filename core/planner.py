@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import re
 from core.ai_scraper import call_llm, get_preferred_site, set_preferred_site
+from core.pipeline_config import MAX_ACTIONS_PER_PHASE, MAX_LLM_CALLS_PER_PHASE, MAX_FILE_WRITES_WITHOUT_BUILD
 
 MAX_RETRIES = 3
 
@@ -65,8 +66,6 @@ def _repair_unescaped_content_quotes(text: str) -> str:
 
         end_q = -1
         if j < len(src) and src[j] in '{[':
-            # Si content empieza con objeto/lista serializado dentro del string,
-            # buscamos el cierre balanceado y luego la comilla del string.
             opener = src[j]
             closer = '}' if opener == '{' else ']'
             balance = 0
@@ -86,7 +85,6 @@ def _repair_unescaped_content_quotes(text: str) -> str:
                             break
                 scan += 1
         else:
-            # fallback general
             scan = j
             while scan < len(src):
                 if src[scan] == '"':
@@ -162,7 +160,13 @@ def _ask_json(prompt: str, preferred_site: str | None = None) -> dict:
 
 def get_master_plan(user_request: str, preferred_site: str | None = None) -> dict:
     prompt = (
-        "Genera un plan maestro para ejecutar la solicitud del usuario.\n"
+        "Genera un plan maestro para ejecutar la solicitud del usuario con fases rígidas y validación incremental.\n"
+        "Incluye exactamente estas fases (puedes agregar subfases internas si hace falta):\n"
+        "1) FASE 1 — ESTRUCTURA ARQUITECTÓNICA\n"
+        "2) FASE 2 — IMPLEMENTACIÓN PROGRESIVA\n"
+        "3) FASE 3 — ACCESIBILIDAD Y SEO\n"
+        "4) FASE 4 — OPTIMIZACIÓN\n"
+        "5) FASE 5 — QUALITY CHECK FINAL\n"
         "Formato obligatorio:\n"
         "{\n"
         '  "phases": [\n'
@@ -172,6 +176,62 @@ def get_master_plan(user_request: str, preferred_site: str | None = None) -> dic
         f"Solicitud del usuario: {user_request}"
     )
     return _ask_json(prompt, preferred_site=preferred_site)
+
+
+def _phase_constraints_text(phase_name: str, context: dict) -> str:
+    low = (phase_name or "").lower()
+    generic = (
+        "LÍMITES OBLIGATORIOS DEL PIPELINE:\n"
+        f"- Máximo {MAX_ACTIONS_PER_PHASE} acciones por fase/subfase.\n"
+        f"- Máximo {MAX_LLM_CALLS_PER_PHASE} llm_call por fase/subfase.\n"
+        f"- Máximo {MAX_FILE_WRITES_WITHOUT_BUILD} escrituras consecutivas (file_write/file_modify) sin build intermedio.\n"
+        "- Debes evaluar el estado actual del proyecto antes de proponer nuevas acciones.\n"
+        "- Prioriza arquitectura antes que diseño visual.\n"
+        "- Si la fase es grande, divídela en subfases controladas.\n"
+    )
+
+    if "fase 1" in low or "estructura" in low:
+        return generic + (
+            "REGLAS FASE 1 — ESTRUCTURA ARQUITECTÓNICA:\n"
+            "- Solo crear o validar estructura base.\n"
+            "- NO generar diseño visual.\n"
+            "- Para Angular standalone: crear componentes standalone vacíos; prohibido NgModule/app.module.ts/loadChildren.\n"
+            "- Incluye ng build al cerrar la fase.\n"
+        )
+
+    if "fase 2" in low or "implementación" in low:
+        return generic + (
+            "REGLAS FASE 2 — IMPLEMENTACIÓN PROGRESIVA:\n"
+            "- Modificar máximo 2 componentes por subfase.\n"
+            "- No modificar más de 3 archivos antes de compilar.\n"
+            "- Después de cada subfase, incluir ng build.\n"
+            "- Prohibido más de una llm_call anidada.\n"
+        )
+
+    if "fase 3" in low or "accesibilidad" in low or "seo" in low:
+        return generic + (
+            "REGLAS FASE 3 — ACCESIBILIDAD Y SEO:\n"
+            "- Solo tocar index.html, atributos semánticos, meta tags, aria-label y alt.\n"
+            "- No modificar arquitectura base.\n"
+            "- Incluye ng build al finalizar.\n"
+        )
+
+    if "fase 4" in low or "optimización" in low:
+        return generic + (
+            "REGLAS FASE 4 — OPTIMIZACIÓN:\n"
+            "- Solo optimizar si existen rutas reales detectadas.\n"
+            "- Evita complejidad innecesaria.\n"
+            "- Incluye ng build al finalizar.\n"
+        )
+
+    if "fase 5" in low or "quality" in low:
+        return generic + (
+            "REGLAS FASE 5 — QUALITY CHECK FINAL:\n"
+            "- Prioriza ng build --configuration production.\n"
+            "- Reporta warnings y evita comandos prohibidos.\n"
+        )
+
+    return generic
 
 
 def get_phase_actions(phase_name: str, context: dict, preferred_site: str | None = None) -> dict:
@@ -231,8 +291,6 @@ def get_phase_actions(phase_name: str, context: dict, preferred_site: str | None
         "✅ BIEN: \"content\": \":focus-visible { outline: 3px solid #667EEA; }\"\n"
     )
 
-
-
     prompt = (
         f"Genera acciones para la fase '{phase_name}'.\n"
         "Formato obligatorio:\n"
@@ -245,6 +303,7 @@ def get_phase_actions(phase_name: str, context: dict, preferred_site: str | None
         "  ]\n"
         "}\n"
         f"{project_block}\n"
+        f"{_phase_constraints_text(phase_name, context)}\n"
         f"{exec_rules}"
     )
 

@@ -15,13 +15,19 @@ from core.action_registry import ALLOWED_ACTIONS
 from core.ai_scraper import call_llm
 from core.state_manager import AgentState
 from core.loop_guard import LoopGuard, LoopGuardError
+from core.pipeline_config import (
+    MAX_ACTIONS_PER_PHASE,
+    MAX_FILE_WRITES_WITHOUT_BUILD,
+    MAX_LLM_CALLS_PER_PHASE,
+    REQUIRE_BUILD_AFTER_PHASE,
+)
 from core.validator import validate_actions, ValidationError
 from core.web_log import log_action_blocked, log_error
 
 WORKSPACE_ROOT = Path(__file__).parent.parent / "workspace"
 WORKSPACE_ROOT.mkdir(parents=True, exist_ok=True)
 TIMEOUT_CMD = 120
-MAX_NESTED_LLM_CALLS = 2
+MAX_NESTED_LLM_CALLS = 1
 MAX_CONTEXT_FILE_BYTES = 3000
 MAX_CONTEXT_FILES = 8
 MAX_CONTEXT_TOTAL_BYTES = 12000
@@ -41,12 +47,84 @@ def es_tarea_agente(texto: str) -> bool:
     return any(trigger in low for trigger in TRIGGERS_AGENTE)
 
 
+
+
+def _is_build_command(command: str) -> bool:
+    low = (command or "").strip().lower()
+    return low.startswith("ng build")
+
+
+def _count_actions(payload: dict, action_type: str) -> int:
+    return sum(1 for a in payload.get("actions", []) if a.get("type") == action_type)
+
+
+def _validate_phase_limits(actions_payload: dict) -> None:
+    actions = list(actions_payload.get("actions", []))
+    if len(actions) > MAX_ACTIONS_PER_PHASE:
+        raise ExecutorError(
+            f"Fase bloqueada: {len(actions)} acciones exceden el máximo ({MAX_ACTIONS_PER_PHASE})."
+        )
+
+    llm_calls = _count_actions(actions_payload, "llm_call")
+    if llm_calls > MAX_LLM_CALLS_PER_PHASE:
+        raise ExecutorError(
+            f"Fase bloqueada: {llm_calls} llm_call exceden el máximo ({MAX_LLM_CALLS_PER_PHASE})."
+        )
+
+
+def _phase_requires_build(actions_payload: dict) -> bool:
+    has_structural_change = any(
+        a.get("type") in {"file_write", "file_modify"}
+        for a in actions_payload.get("actions", [])
+    )
+    has_build = any(
+        a.get("type") == "command" and _is_build_command(a.get("command", ""))
+        for a in actions_payload.get("actions", [])
+    )
+    return REQUIRE_BUILD_AFTER_PHASE and has_structural_change and not has_build
+
+
+def _inject_build_if_needed(actions_payload: dict) -> dict:
+    if not _phase_requires_build(actions_payload):
+        return actions_payload
+
+    actions = list(actions_payload.get("actions", []))
+    if len(actions) >= MAX_ACTIONS_PER_PHASE:
+        raise ExecutorError(
+            "Fase bloqueada: se requiere ng build por cambios estructurales y no hay espacio por límite de acciones."
+        )
+
+    return {"actions": [*actions, {"type": "command", "command": "ng build"}]}
+
+
+def _validate_consecutive_writes(actions_payload: dict) -> None:
+    streak = 0
+    for action in actions_payload.get("actions", []):
+        t = action.get("type")
+        if t in {"file_write", "file_modify"}:
+            streak += 1
+            if streak > MAX_FILE_WRITES_WITHOUT_BUILD:
+                raise ExecutorError(
+                    f"Fase bloqueada: más de {MAX_FILE_WRITES_WITHOUT_BUILD} escrituras consecutivas sin build."
+                )
+            continue
+
+        if t == "command" and _is_build_command(action.get("command", "")):
+            streak = 0
+            continue
+
+        if t != "llm_call":
+            streak = 0
+
 class ActionExecutor:
     def __init__(self, workspace: Path | None = None):
         self.workspace = (workspace or WORKSPACE_ROOT).resolve()
 
     def execute_actions(self, actions_payload: dict, state: AgentState) -> list[dict[str, Any]]:
-        return self._execute_actions(actions_payload, state, nested_depth=0)
+        validated_payload = _inject_build_if_needed(actions_payload)
+        _validate_phase_limits(validated_payload)
+        _validate_consecutive_writes(validated_payload)
+        return self._execute_actions(validated_payload, state, nested_depth=0)
 
     def _execute_actions(self, actions_payload: dict, state: AgentState, nested_depth: int) -> list[dict[str, Any]]:
         actions = actions_payload.get("actions", [])

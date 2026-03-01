@@ -14,7 +14,7 @@ ai_scraper_stub.available_sites = lambda: ["chatgpt", "claude", "gemini", "qwen"
 sys.modules["core.ai_scraper"] = ai_scraper_stub
 
 from core.agent import ExecutorError, execute_command, modify_file, write_file, _block_interactive_commands, ActionExecutor
-from core.orchestrator import _build_task_workspace, _parse_angular_cli_version, _snapshot_project_files, _strip_ansi, _build_angular_rules, _validate_action_consistency, _sanitize_project_name, _build_ng_new_command, _project_has_lint_target
+from core.orchestrator import _build_task_workspace, _parse_angular_cli_version, _snapshot_project_files, _strip_ansi, _build_angular_rules, _validate_action_consistency, _sanitize_project_name, _build_ng_new_command, _project_has_lint_target, _enforce_rigid_pipeline
 from core.state_manager import AgentState
 from core import planner as planner_mod
 import core.agent as agent_mod
@@ -531,6 +531,8 @@ export class AppComponent {}""",
         project = task / "proj"
         (project / "src" / "app").mkdir(parents=True, exist_ok=True)
         (project / "angular.json").write_text('{"projects":{"app":{"architect":{}}}}', encoding="utf-8")
+        (project / "package.json").write_text("{}", encoding="utf-8")
+        (project / "src" / "main.ts").write_text("console.log(1);", encoding="utf-8")
 
         captured_contexts: list[dict] = []
         round_counter = {"n": 0}
@@ -543,8 +545,10 @@ export class AppComponent {}""",
         original_get_actions = orch_mod.get_phase_actions
         original_quality = orch_mod._run_quality_checks
         original_autofix = orch_mod._autofix_with_llm
+        original_require_precheck = orch_mod.REQUIRE_PRECHECK
 
         orch_mod._build_task_workspace = lambda user_request, workspace=None: task
+        orch_mod.REQUIRE_PRECHECK = False
         orch_mod.detect_angular_cli_version = lambda: "21.1.5"
         orch_mod.detect_node_npm_os = lambda: {"node": "v20", "npm": "10", "os": "Linux"}
 
@@ -589,6 +593,7 @@ export class AppComponent {}""",
             orch_mod.get_phase_actions = original_get_actions
             orch_mod._run_quality_checks = original_quality
             orch_mod._autofix_with_llm = original_autofix
+            orch_mod.REQUIRE_PRECHECK = original_require_precheck
 
         self.assertTrue(result["ok"])
         self.assertEqual(len(captured_contexts), 2)
@@ -633,7 +638,7 @@ export class AppComponent {}""",
         self.assertEqual(state.phase_action_count, 1)
         self.assertEqual(len(state.action_history), 4)
 
-    def test_execute_actions_checks_loop_guard_per_action(self):
+    def test_execute_actions_blocks_phase_with_too_many_actions(self):
         base = Path(tempfile.mkdtemp(prefix="sonny_action_limit_"))
         task = base / "task_action_limit"
         task.mkdir(parents=True, exist_ok=True)
@@ -644,14 +649,14 @@ export class AppComponent {}""",
 
         actions = [
             {"type": "file_write", "path": f"src/app/file_{idx}.ts", "content": "export const x = 1;"}
-            for idx in range(11)
+            for idx in range(6)
         ]
 
         executor = ActionExecutor(workspace=task)
         with self.assertRaises(ExecutorError):
             executor.execute_actions({"actions": actions}, state)
 
-        self.assertEqual(state.phase_action_count, 11)
+        self.assertEqual(state.phase_action_count, 0)
 
     def test_project_has_lint_target_detection(self):
         base = Path(tempfile.mkdtemp(prefix="sonny_lint_target_"))
@@ -683,12 +688,86 @@ export class AppComponent {}""",
         self.assertFalse(results[0]["ok"])
         self.assertIn("anidadas", results[0]["error"])
 
+
+    def test_enforce_rigid_pipeline_generates_all_required_phases(self):
+        plan = {
+            "phases": [
+                {"name": "FASE 1 — ESTRUCTURA ARQUITECTÓNICA", "description": "x", "depends_on": []},
+                {"name": "FASE 3 — ACCESIBILIDAD Y SEO", "description": "y", "depends_on": []},
+            ]
+        }
+
+        rigid = _enforce_rigid_pipeline(plan)
+        names = [p["name"] for p in rigid["phases"]]
+        self.assertEqual(len(names), 5)
+        self.assertEqual(names[0], "FASE 1 — ESTRUCTURA ARQUITECTÓNICA")
+        self.assertEqual(names[-1], "FASE 5 — QUALITY CHECK FINAL")
+
     def test_task_workspace_isolation_unique_folders(self):
         a = _build_task_workspace("desarrolla una landing", None)
         b = _build_task_workspace("desarrolla una landing", None)
         self.assertNotEqual(str(a), str(b))
         self.assertTrue(a.exists())
         self.assertTrue(b.exists())
+
+    def test_execute_actions_injects_build_after_structural_changes(self):
+        base = Path(tempfile.mkdtemp(prefix="sonny_build_inject_"))
+        task = base / "task_build_inject"
+        task.mkdir(parents=True, exist_ok=True)
+
+        (task / "angular.json").write_text("{}", encoding="utf-8")
+        state = AgentState()
+        state.set_task_workspace(task)
+        state.set_project_root(task)
+        state.set_phase("FASE 1 — ESTRUCTURA ARQUITECTÓNICA")
+
+        commands: list[str] = []
+        original_run = agent_mod.subprocess.run
+
+        def fake_run(cmd, shell, cwd, capture_output, text, timeout, encoding, errors):
+            commands.append(cmd)
+            return types.SimpleNamespace(returncode=0, stdout="ok", stderr="")
+
+        agent_mod.subprocess.run = fake_run
+        try:
+            executor = ActionExecutor(workspace=task)
+            results = executor.execute_actions(
+                {
+                    "actions": [
+                        {"type": "file_write", "path": "src/app/a.ts", "content": "export const a=1;"},
+                        {"type": "file_modify", "path": "src/app/b.ts", "content": "export const b=1;"},
+                    ]
+                },
+                state,
+            )
+        finally:
+            agent_mod.subprocess.run = original_run
+
+        self.assertTrue(any(cmd == "ng build" for cmd in commands))
+        self.assertEqual(len(results), 3)
+
+    def test_execute_actions_blocks_too_many_consecutive_writes(self):
+        base = Path(tempfile.mkdtemp(prefix="sonny_write_streak_"))
+        task = base / "task_write_streak"
+        task.mkdir(parents=True, exist_ok=True)
+
+        state = AgentState()
+        state.set_task_workspace(task)
+        state.set_phase("FASE 2 — IMPLEMENTACIÓN PROGRESIVA")
+
+        executor = ActionExecutor(workspace=task)
+        with self.assertRaises(ExecutorError):
+            executor.execute_actions(
+                {
+                    "actions": [
+                        {"type": "file_write", "path": "src/app/a.ts", "content": "export const a=1;"},
+                        {"type": "file_write", "path": "src/app/b.ts", "content": "export const b=1;"},
+                        {"type": "file_write", "path": "src/app/c.ts", "content": "export const c=1;"},
+                        {"type": "file_modify", "path": "src/app/d.ts", "content": "export const d=1;"},
+                    ]
+                },
+                state,
+            )
 
 
 if __name__ == "__main__":
