@@ -13,8 +13,9 @@ ai_scraper_stub.available_sites = lambda: ["chatgpt", "claude", "gemini", "qwen"
 sys.modules["core.ai_scraper"] = ai_scraper_stub
 
 from core.agent import ExecutorError, execute_command, modify_file, write_file, _block_interactive_commands
-from core.orchestrator import _build_task_workspace, _parse_angular_cli_version
+from core.orchestrator import _build_task_workspace, _parse_angular_cli_version, _snapshot_project_files
 from core.state_manager import AgentState
+from core import planner as planner_mod
 
 
 class TestExecutionPaths(unittest.TestCase):
@@ -103,6 +104,48 @@ Package Manager   : npm 11.10.1
         self.assertEqual(_parse_angular_cli_version(sample), "21.1.5")
         self.assertEqual(_parse_angular_cli_version("Angular CLI 19.2.3"), "19.2.3")
         self.assertEqual(_parse_angular_cli_version("random output"), "unknown")
+
+
+    def test_snapshot_scans_real_src_app_tree(self):
+        base = Path(tempfile.mkdtemp(prefix="sonny_snapshot_"))
+        project = base / "proj"
+        (project / "src" / "app" / "nested").mkdir(parents=True, exist_ok=True)
+        (project / "src" / "app" / "app.ts").write_text("export const x=1", encoding="utf-8")
+        (project / "src" / "app" / "nested" / "cmp.html").write_text("<p>x</p>", encoding="utf-8")
+        snap = _snapshot_project_files(base, project)
+        self.assertIn("src/app/app.ts", snap["existing"])
+        self.assertIn("src/app/nested/cmp.html", snap["app_tree"])
+
+    def test_planner_injects_project_context_block(self):
+        captured = {"prompt": ""}
+
+        def fake_call(prompt: str) -> str:
+            captured["prompt"] = prompt
+            return '{"actions": [{"type": "llm_call", "prompt": "ok"}]}'
+
+        planner_mod.call_llm = fake_call
+        payload = planner_mod.get_phase_actions(
+            "fase-demo",
+            {
+                "task_workspace": "/tmp/task",
+                "project_root": "/tmp/task/proj",
+                "current_workdir": "/tmp/task/proj",
+                "angular_cli_version": "21.1.5",
+                "angular_project_version": "21.1.5",
+                "runtime_env": {"node": "v20", "npm": "10", "os": "Windows"},
+                "project_structure": "standalone_components (NO NgModules)",
+                "existing_files": ["src/app/app.ts"],
+                "missing_files": ["src/app/app.module.ts"],
+                "app_tree": ["src/app/app.ts"],
+                "valid_commands": ["ng build --configuration production (NO --prod)"],
+                "deprecated_commands": ["ng build --prod"],
+                "angular_rules": ["Usa app.ts y app.html"],
+            },
+        )
+        self.assertIn("CONTEXTO DEL PROYECTO ANGULAR", captured["prompt"])
+        self.assertIn("ARCHIVOS QUE EXISTEN", captured["prompt"])
+        self.assertIn("COMANDOS VÁLIDOS", captured["prompt"])
+        self.assertEqual(payload["actions"][0]["type"], "llm_call")
 
     def test_task_workspace_isolation_unique_folders(self):
         a = _build_task_workspace("desarrolla una landing", None)

@@ -155,7 +155,12 @@ def _angular_project_version(project_root: Path | None) -> str:
 def _snapshot_project_files(task_workspace: Path, project_root: Path | None) -> dict:
     target = project_root or task_workspace
     if not target.exists():
-        return {"existing": [], "missing": [], "structure": "unknown"}
+        return {"existing": [], "missing": [], "structure": "unknown", "app_tree": []}
+
+    app_dir = target / "src" / "app"
+    app_tree: list[str] = []
+    if app_dir.exists():
+        app_tree = [str(p.relative_to(target)).replace("\\", "/") for p in sorted(app_dir.rglob("*")) if p.is_file()]
 
     key_files = [
         "src/app/app.ts",
@@ -171,14 +176,14 @@ def _snapshot_project_files(task_workspace: Path, project_root: Path | None) -> 
 
     existing, missing = [], []
     for rel in key_files:
-        p = target / rel
-        if p.exists():
+        candidate = target / rel
+        if candidate.exists():
             existing.append(rel)
         else:
             missing.append(rel)
 
     structure = "standalone_components (NO NgModules)" if "src/app/app.config.ts" in existing else "ngmodules"
-    return {"existing": existing, "missing": missing, "structure": structure}
+    return {"existing": existing, "missing": missing, "structure": structure, "app_tree": app_tree}
 
 
 def _failed_action_summaries(state: AgentState) -> list[dict]:
@@ -318,6 +323,7 @@ def run_orchestrator(
             "project_structure": snap["structure"],
             "existing_files": snap["existing"],
             "missing_files": snap["missing"],
+            "app_tree": snap["app_tree"],
             "valid_commands": [
                 "ng build --configuration production (NO --prod)",
                 "ng test --no-watch --browsers=ChromeHeadless",
