@@ -221,6 +221,55 @@ Package Manager   : npm 11.10.1
         self.assertEqual(captured["prompt"].count("• src/app/app.ts"), 2)  # existing + app_tree
         self.assertEqual(captured["prompt"].count("• ng build --configuration production"), 1)
 
+    def test_planner_prompt_includes_forbidden_commands_from_context(self):
+        captured = {"prompt": ""}
+
+        def fake_call(prompt: str) -> str:
+            captured["prompt"] = prompt
+            return '{"actions": [{"type": "llm_call", "prompt": "ok"}]}'
+
+        planner_mod.call_llm = fake_call
+        planner_mod.get_phase_actions(
+            "fase-autofix",
+            {
+                "forbidden_commands": ["ng lint", "ng serve"],
+            },
+        )
+
+        self.assertIn("COMANDOS PROHIBIDOS (NO los uses bajo ninguna circunstancia)", captured["prompt"])
+        self.assertIn("• ng lint", captured["prompt"])
+        self.assertIn("• ng serve", captured["prompt"])
+
+    def test_planner_prompt_includes_accumulated_quality_failures(self):
+        captured = {"prompt": ""}
+
+        def fake_call(prompt: str) -> str:
+            captured["prompt"] = prompt
+            return '{"actions": [{"type": "llm_call", "prompt": "ok"}]}'
+
+        planner_mod.call_llm = fake_call
+        planner_mod.get_phase_actions(
+            "fase-autofix",
+            {
+                "accumulated_quality_failures": [
+                    {
+                        "command": "ng build --configuration production",
+                        "exit_code": 1,
+                        "output": "ERROR in src/app/app.ts: Type 'x' is not assignable",
+                    },
+                    {
+                        "command": "ng test --no-watch --browsers=ChromeHeadless",
+                        "exit_code": 1,
+                        "output": "FAILED: AppComponent should render title",
+                    },
+                ],
+            },
+        )
+
+        self.assertIn("FALLOS ACUMULADOS EN RONDAS ANTERIORES DE CALIDAD", captured["prompt"])
+        self.assertIn("• ng build --configuration production → exit 1", captured["prompt"])
+        self.assertIn("• ng test --no-watch --browsers=ChromeHeadless → exit 1", captured["prompt"])
+
     def test_strip_ansi_from_cli_output(self):
         raw = "\x1b[36mAngular CLI\x1b[39m : \x1b[33m21.1.5\x1b[39m"
         cleaned = _strip_ansi(raw)
