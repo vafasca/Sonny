@@ -25,7 +25,6 @@ PROTECTED_FILES = {
     "package.json",
     "main.ts",
     "index.html",
-    "app.config.ts",
 }
 
 
@@ -128,5 +127,6 @@ def _validate_path(path: str) -> None:
         raise ValidationError(f"Path traversal bloqueado: '{path}'.")
 
     normalized = cleaned.split("/")[-1].lower()
-    if normalized in PROTECTED_FILES:
+    is_top_level = "/" not in cleaned
+    if is_top_level and normalized in PROTECTED_FILES:
         raise ValidationError(f"Archivo protegido bloqueado: '{path}'.")

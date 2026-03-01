@@ -13,9 +13,10 @@ ai_scraper_stub.available_sites = lambda: ["chatgpt", "claude", "gemini", "qwen"
 sys.modules["core.ai_scraper"] = ai_scraper_stub
 
 from core.agent import ExecutorError, execute_command, modify_file, write_file, _block_interactive_commands
-from core.orchestrator import _build_task_workspace, _parse_angular_cli_version, _snapshot_project_files
+from core.orchestrator import _build_task_workspace, _parse_angular_cli_version, _snapshot_project_files, _strip_ansi, _build_angular_rules
 from core.state_manager import AgentState
 from core import planner as planner_mod
+from core.validator import validate_actions, ValidationError
 
 
 class TestExecutionPaths(unittest.TestCase):
@@ -146,6 +147,28 @@ Package Manager   : npm 11.10.1
         self.assertIn("ARCHIVOS QUE EXISTEN", captured["prompt"])
         self.assertIn("COMANDOS VÁLIDOS", captured["prompt"])
         self.assertEqual(payload["actions"][0]["type"], "llm_call")
+
+
+    def test_strip_ansi_from_cli_output(self):
+        raw = "\x1b[36mAngular CLI\x1b[39m : \x1b[33m21.1.5\x1b[39m"
+        cleaned = _strip_ansi(raw)
+        self.assertIn("Angular CLI", cleaned)
+        self.assertIn("21.1.5", cleaned)
+        self.assertNotIn("\x1b", cleaned)
+
+    def test_dynamic_angular_rules_by_structure(self):
+        standalone = _build_angular_rules("standalone_components (NO NgModules)", "21.1.5")
+        ngmodules = _build_angular_rules("ngmodules", "14.2.0")
+        self.assertTrue(any("NO NgModules" in r or "standalone" in r.lower() for r in standalone))
+        self.assertTrue(any("app.module.ts" in r for r in ngmodules))
+
+    def test_validator_allows_nested_app_config(self):
+        payload = {
+            "actions": [
+                {"type": "file_write", "path": "src/app/app.config.ts", "content": "x"}
+            ]
+        }
+        validate_actions(payload)
 
     def test_task_workspace_isolation_unique_folders(self):
         a = _build_task_workspace("desarrolla una landing", None)

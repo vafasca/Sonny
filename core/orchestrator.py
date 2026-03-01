@@ -28,6 +28,10 @@ class C:
     RESET = "\033[0m"
 
 
+def _strip_ansi(text: str) -> str:
+    return re.sub(r"\x1b\[[0-9;]*[a-zA-Z]", "", text or "")
+
+
 def _run_cmd_utf8(cmd: str, cwd: Path | None = None, timeout: int = 30) -> tuple[int, str]:
     proc = subprocess.run(
         cmd,
@@ -40,7 +44,7 @@ def _run_cmd_utf8(cmd: str, cwd: Path | None = None, timeout: int = 30) -> tuple
         timeout=timeout,
     )
     out = (proc.stdout or "") + ("\n" + proc.stderr if proc.stderr else "")
-    return proc.returncode, out.strip()
+    return proc.returncode, _strip_ansi(out).strip()
 
 
 def _parse_angular_cli_version(output: str) -> str:
@@ -269,6 +273,54 @@ def _autofix_with_llm(
     return executor.execute_actions(actions_payload, state)
 
 
+
+
+def _version_major(version_text: str) -> int | None:
+    m = re.search(r"(\d+)", str(version_text or ""))
+    return int(m.group(1)) if m else None
+
+
+def _build_angular_rules(project_structure: str, project_version: str) -> list[str]:
+    rules = [
+        "Genera acciones válidas para la estructura detectada; no mezcles arquitecturas.",
+        "Usa rutas relativas y evita tocar archivos fuera del proyecto.",
+    ]
+
+    major = _version_major(project_version)
+    if project_structure == "ngmodules":
+        rules += [
+            "NO uses ni modifiques app.config.ts.",
+            "Usa app.module.ts como configuración central.",
+        ]
+    elif project_structure == "standalone_components (NO NgModules)":
+        rules += [
+            "Usa componentes standalone (NO NgModules).",
+            "app.config.ts es central y puede modificarse si es necesario.",
+            "No crees app.module.ts salvo que exista explícitamente en el árbol real.",
+        ]
+    else:
+        if major is not None and major >= 17:
+            rules += [
+                "Estructura unknown: asume standalone por Angular >= 17.",
+                "Prefiere app.ts/app.html/app.config.ts.",
+            ]
+        elif major is not None and major < 15:
+            rules += [
+                "Estructura unknown: asume NgModule por Angular < 15.",
+                "Prefiere app.module.ts y evita app.config.ts.",
+            ]
+        else:
+            rules += [
+                "Estructura unknown en Angular 15-16: NO asumas arquitectura.",
+                "Consulta el árbol real; si falta evidencia, crea con file_write sin reemplazar estructura base.",
+            ]
+
+    rules += [
+        "Usa ng build --configuration production (NO --prod).",
+        "ng lint requiere target lint (si falta, primero instala/configura angular-eslint).",
+    ]
+    return rules
+
 def run_orchestrator(
     user_request: str,
     workspace: Path | None = None,
@@ -331,11 +383,7 @@ def run_orchestrator(
                 "ng e2e",
             ],
             "deprecated_commands": ["ng build --prod"],
-            "angular_rules": [
-                "Usa componentes standalone (NO NgModules)",
-                "Usa app.ts y app.html (NO app.component.ts/html) en Angular 21+",
-                "NO existe environments/ por defecto en Angular 21+",
-            ],
+            "angular_rules": _build_angular_rules(snap["structure"], state.angular_project_version),
         }
 
         try:
