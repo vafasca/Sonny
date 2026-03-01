@@ -20,8 +20,12 @@ from core.web_log import log_error, log_validation_failed, log_action_blocked, l
 
 
 class C:
-    CYAN="\033[96m"; GREEN="\033[92m"; YELLOW="\033[93m"; RED="\033[91m"
-    DIM="\033[2m"; RESET="\033[0m"
+    CYAN = "\033[96m"
+    GREEN = "\033[92m"
+    YELLOW = "\033[93m"
+    RED = "\033[91m"
+    DIM = "\033[2m"
+    RESET = "\033[0m"
 
 
 def _run_cmd_utf8(cmd: str, cwd: Path | None = None, timeout: int = 30) -> tuple[int, str]:
@@ -44,13 +48,11 @@ def _parse_angular_cli_version(output: str) -> str:
     if not txt:
         return "unknown"
 
-    # Formato típico: "Angular CLI       : 21.1.5"
     for line in txt.splitlines():
         low = line.lower()
         if "angular cli" in low and ":" in line:
             return line.split(":", 1)[1].strip() or "unknown"
 
-    # Fallback defensivo: intentar capturar "Angular CLI 21.1.5"
     m = re.search(r"angular\s+cli\s*:?\s*v?(\d+(?:\.\d+){1,3})", txt, flags=re.IGNORECASE)
     if m:
         return m.group(1)
@@ -59,12 +61,7 @@ def _parse_angular_cli_version(output: str) -> str:
 
 
 def detect_angular_cli_version() -> str:
-    attempts = [
-        "ng version --no-interactive",
-        "ng version",
-        "ng v",
-    ]
-
+    attempts = ["ng version --no-interactive", "ng version", "ng v"]
     saw_any_output = False
     for cmd in attempts:
         code, out = _run_cmd_utf8(cmd)
@@ -73,11 +70,8 @@ def detect_angular_cli_version() -> str:
             parsed = _parse_angular_cli_version(out)
             if parsed != "unknown":
                 return parsed
-
-        # si el comando ejecutó y respondió pero no parseó, intentar siguiente variante
         if code == 0 and out:
             continue
-
     return "unknown" if saw_any_output else "not_installed"
 
 
@@ -164,10 +158,12 @@ def _snapshot_project_files(task_workspace: Path, project_root: Path | None) -> 
         return {"existing": [], "missing": [], "structure": "unknown"}
 
     key_files = [
-        "src/app/app.html",
         "src/app/app.ts",
+        "src/app/app.html",
         "src/app/app.config.ts",
         "src/app/app.routes.ts",
+        "src/styles.scss",
+        "src/app/app.component.ts",
         "src/app/app.component.html",
         "src/app/app.module.ts",
         "src/environments/environment.prod.ts",
@@ -187,7 +183,7 @@ def _snapshot_project_files(task_workspace: Path, project_root: Path | None) -> 
 
 def _failed_action_summaries(state: AgentState) -> list[dict]:
     failed = []
-    for entry in state.action_history[-12:]:
+    for entry in state.action_history[-20:]:
         result = entry.get("result", {})
         if result.get("ok") is False:
             failed.append(
@@ -197,43 +193,8 @@ def _failed_action_summaries(state: AgentState) -> list[dict]:
                     "error": result.get("error", "unknown"),
                 }
             )
-    return failed[-5:]
+    return failed[-6:]
 
-
-
-
-def _run_quality_checks(project_root: Path) -> tuple[list[dict], list[dict]]:
-    """Ejecuta suite de validación solicitada (lint/test/build/e2e)."""
-    checks = [
-        ("ng lint", "Análisis Estático", 120),
-        ("ng test --no-watch --browsers=ChromeHeadless", "Pruebas Unitarias", 300),
-        ("ng build --configuration production", "Prueba de Compilación (AOT)", 300),
-        ("ng e2e", "Pruebas de Extremo a Extremo", 300),
-    ]
-
-    failures: list[dict] = []
-    reports: list[dict] = []
-
-    for cmd, check_type, timeout in checks:
-        code, out = _run_cmd_utf8(cmd, cwd=project_root, timeout=timeout)
-        report = {"command": cmd, "type": check_type, "ok": code == 0, "exit_code": code, "output": out[-4000:]}
-        reports.append(report)
-        if code != 0:
-            failures.append(report)
-
-    return failures, reports
-
-
-def _autofix_with_llm(
-    phase_name: str,
-    fix_context: dict,
-    executor: ActionExecutor,
-    state: AgentState,
-    preferred_site: str | None,
-) -> list[dict]:
-    actions_payload = get_phase_actions(phase_name, fix_context, preferred_site=preferred_site)
-    validate_actions(actions_payload)
-    return executor.execute_actions(actions_payload, state)
 
 def _sync_state_before_phase(state: AgentState, task_workspace: Path) -> None:
     if not state.current_workdir or not Path(state.current_workdir).exists():
@@ -243,6 +204,64 @@ def _sync_state_before_phase(state: AgentState, task_workspace: Path) -> None:
     if project:
         state.set_project_root(project)
         state.angular_project_version = _angular_project_version(project)
+
+
+def _phase_generates_code(actions_payload: dict) -> bool:
+    actions = actions_payload.get("actions", [])
+    for action in actions:
+        t = action.get("type")
+        if t in {"file_write", "file_modify"}:
+            return True
+        if t == "command":
+            cmd = (action.get("command") or "").lower()
+            if any(k in cmd for k in ("ng new", "ng g", "ng generate", "npm install", "ng add")):
+                return True
+    return False
+
+
+def _run_quality_checks(project_root: Path) -> tuple[list[dict], list[dict]]:
+    checks = [
+        ("ng build --configuration production", "Prueba de Compilación (AOT)", 300),
+        ("ng lint", "Análisis Estático", 120),
+        ("ng test --no-watch --browsers=ChromeHeadless", "Pruebas Unitarias", 300),
+        ("ng e2e", "Pruebas de Extremo a Extremo", 300),
+    ]
+
+    failures: list[dict] = []
+    reports: list[dict] = []
+
+    for cmd, check_type, timeout in checks:
+        code, out = _run_cmd_utf8(cmd, cwd=project_root, timeout=timeout)
+        report = {
+            "command": cmd,
+            "type": check_type,
+            "ok": code == 0,
+            "exit_code": code,
+            "output": out[-4000:],
+        }
+        reports.append(report)
+        if code != 0:
+            failures.append(report)
+
+    return failures, reports
+
+
+def _print_checklist(reports: list[dict], round_num: int) -> None:
+    print(f"  {C.CYAN}Checklist calidad (ronda {round_num}):{C.RESET}")
+    for item in reports:
+        icon = "✅" if item.get("ok") else "❌"
+        print(f"    {icon} {item['command']} [{item['type']}]")
+
+
+def _autofix_with_llm(
+    fix_context: dict,
+    executor: ActionExecutor,
+    state: AgentState,
+    preferred_site: str | None,
+) -> list[dict]:
+    actions_payload = get_phase_actions("Corrección automática de calidad", fix_context, preferred_site=preferred_site)
+    validate_actions(actions_payload)
+    return executor.execute_actions(actions_payload, state)
 
 
 def run_orchestrator(
@@ -289,6 +308,7 @@ def run_orchestrator(
             "completed_phases": state.completed_phases,
             "action_history": state.action_history[-10:],
             "failed_actions": _failed_action_summaries(state),
+            "errores_compilacion": [],
             "task_workspace": str(state.task_workspace) if state.task_workspace else "",
             "current_workdir": str(state.current_workdir) if state.current_workdir else "",
             "project_root": str(state.project_root) if state.project_root else "",
@@ -300,9 +320,16 @@ def run_orchestrator(
             "missing_files": snap["missing"],
             "valid_commands": [
                 "ng build --configuration production (NO --prod)",
-                "ng add @angular-eslint/schematics (antes de ng lint)",
+                "ng test --no-watch --browsers=ChromeHeadless",
+                "ng lint (requiere angular-eslint)",
+                "ng e2e",
             ],
             "deprecated_commands": ["ng build --prod"],
+            "angular_rules": [
+                "Usa componentes standalone (NO NgModules)",
+                "Usa app.ts y app.html (NO app.component.ts/html) en Angular 21+",
+                "NO existe environments/ por defecto en Angular 21+",
+            ],
         }
 
         try:
@@ -344,72 +371,61 @@ def run_orchestrator(
             log_error("orchestrator", f"Error en fase '{phase_name}': {exc}")
             raise
 
-    # Validación final obligatoria para entregar aplicación funcionando.
-    if state.project_root and Path(state.project_root).exists():
-        print(f"  {C.CYAN}▶ Suite de calidad final en: {state.project_root}{C.RESET}")
-        max_fix_rounds = 2
-        for round_num in range(max_fix_rounds + 1):
-            failures, reports = _run_quality_checks(Path(state.project_root))
-            phase_results.append({
-                "phase": f"quality_checks_round_{round_num}",
-                "results": reports,
-                "cwd": str(state.project_root),
-                "project_root": str(state.project_root),
-            })
-            if not failures:
-                print(f"  {C.GREEN}✅ Suite de calidad aprobada (lint/test/build/e2e).{C.RESET}")
-                break
-            if round_num >= max_fix_rounds:
-                print(f"  {C.RED}❌ Persisten fallas tras auto-fix: {len(failures)} check(s).{C.RESET}")
-                break
+        # Validación post-fase con auto-corrección (máx 3 intentos)
+        if state.project_root and _phase_generates_code(actions_payload):
+            print(f"  {C.CYAN}▶ Verificando calidad tras fase: {phase_name}{C.RESET}")
+            max_fix_rounds = 3
+            for round_num in range(1, max_fix_rounds + 1):
+                failures, reports = _run_quality_checks(Path(state.project_root))
+                _print_checklist(reports, round_num)
 
-            print(f"  {C.YELLOW}⚠️ Fallaron {len(failures)} checks, solicitando auto-corrección al LLM...{C.RESET}")
-            fix_context = {
-                "user_request": user_request,
-                "phase": {
-                    "name": "Corrección automática de calidad",
-                    "description": "Corrige errores de lint/test/build/e2e usando solo rutas relativas y comandos no interactivos.",
-                    "depends_on": [phase_results[-1]["phase"]],
-                },
-                "completed_phases": state.completed_phases,
-                "action_history": state.action_history[-20:],
-                "failed_actions": _failed_action_summaries(state),
-                "failed_checks": failures,
-                "task_workspace": str(state.task_workspace) if state.task_workspace else "",
-                "current_workdir": str(state.current_workdir) if state.current_workdir else "",
-                "project_root": str(state.project_root) if state.project_root else "",
-                "angular_cli_version": state.angular_cli_version,
-                "angular_project_version": state.angular_project_version,
-                "runtime_env": runtime_env,
-                "project_structure": _snapshot_project_files(task_workspace, state.project_root)["structure"],
-                "existing_files": _snapshot_project_files(task_workspace, state.project_root)["existing"],
-                "missing_files": _snapshot_project_files(task_workspace, state.project_root)["missing"],
-                "valid_commands": [
-                    "ng lint",
-                    "ng test --no-watch --browsers=ChromeHeadless",
-                    "ng build --configuration production",
-                    "ng e2e",
-                ],
-                "forbidden_commands": ["ng serve", "npm start", "npm run start"],
-            }
-            try:
-                fix_results = _autofix_with_llm(
-                    "Corrección automática de calidad",
-                    fix_context,
-                    executor,
-                    state,
-                    preferred_site,
+                phase_results.append(
+                    {
+                        "phase": f"quality_checks_{phase_name}_round_{round_num}",
+                        "results": reports,
+                        "cwd": str(state.project_root),
+                        "project_root": str(state.project_root),
+                    }
                 )
-                phase_results.append({
-                    "phase": f"quality_autofix_round_{round_num}",
-                    "results": fix_results,
-                    "cwd": str(state.current_workdir or state.project_root),
-                    "project_root": str(state.project_root) if state.project_root else "",
-                })
-            except Exception as exc:
-                log_error("orchestrator", f"Auto-fix de calidad falló: {exc}")
-                break
 
+                if not failures:
+                    print(f"  {C.GREEN}✅ Fase '{phase_name}' verificada y compilable.{C.RESET}")
+                    break
+
+                if round_num == max_fix_rounds:
+                    print(f"  {C.RED}❌ Fase '{phase_name}' no se pudo estabilizar tras {max_fix_rounds} intentos.{C.RESET}")
+                    break
+
+                print(f"  {C.YELLOW}⚠️ Corrigiendo errores detectados ({len(failures)}) con LLM...{C.RESET}")
+                fix_context = {
+                    **context,
+                    "phase": {
+                        "name": f"Corrección automática ({phase_name})",
+                        "description": "Corrige errores de build/lint/test/e2e sin usar comandos interactivos.",
+                        "depends_on": [phase_name],
+                    },
+                    "failed_checks": failures,
+                    "errores_compilacion": failures,
+                    "forbidden_commands": ["ng serve", "npm start", "npm run start"],
+                    "action_history": state.action_history[-20:],
+                    "failed_actions": _failed_action_summaries(state),
+                }
+
+                try:
+                    fix_results = _autofix_with_llm(fix_context, executor, state, preferred_site)
+                    phase_results.append(
+                        {
+                            "phase": f"quality_autofix_{phase_name}_round_{round_num}",
+                            "results": fix_results,
+                            "cwd": str(state.current_workdir or state.project_root),
+                            "project_root": str(state.project_root) if state.project_root else "",
+                        }
+                    )
+                except Exception as exc:
+                    log_error("orchestrator", f"Auto-fix de calidad falló en fase '{phase_name}': {exc}")
+                    break
+
+    print(f"  {C.GREEN}✅ Orquestación finalizada.{C.RESET}")
     return {
         "ok": True,
         "plan": master_plan,
