@@ -28,6 +28,11 @@ from core.web_log import (
 )
 
 
+class C:
+    CYAN="\033[96m"; GREEN="\033[92m"; YELLOW="\033[93m"; RED="\033[91m"
+    DIM="\033[2m"; RESET="\033[0m"
+
+
 def _sort_phases(plan: dict) -> list[dict]:
     phases = plan.get("phases", [])
     by_name = {p["name"]: p for p in phases}
@@ -80,6 +85,7 @@ def run_orchestrator(
 
     phase_results: list[dict] = []
     ordered_phases = _sort_phases(master_plan)
+    print(f"  {C.CYAN}Plan validado: {len(ordered_phases)} fase(s){C.RESET}")
 
     for phase in ordered_phases:
         phase_name = phase["name"]
@@ -101,6 +107,12 @@ def run_orchestrator(
             raise
 
         log_phase_event(phase_name, "start")
+        actions = actions_payload.get("actions", [])
+        print(f"  {C.CYAN}▶ Fase: {phase_name}{C.RESET} {C.DIM}({len(actions)} acciones){C.RESET}")
+        for idx, action in enumerate(actions, 1):
+            atype = action.get("type", "unknown")
+            detail = action.get("path") or action.get("command") or action.get("prompt", "")[:60]
+            print(f"    {C.DIM}- [{idx}/{len(actions)}] {atype}: {detail}{C.RESET}")
 
         try:
             results = executor.execute_actions(actions_payload, state)
@@ -112,7 +124,7 @@ def run_orchestrator(
             log_phase_event(phase_name, "completed", f"actions={len(results)}")
         except LoopGuardError as exc:
             log_loop_detected(phase_name, str(exc))
-            raise
+            raise LoopGuardError(f"{exc} | fase={phase_name} | iteraciones={state.iteration_count}")
         except Exception as exc:
             log_error("orchestrator", f"Error en fase '{phase_name}': {exc}")
             raise

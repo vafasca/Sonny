@@ -31,8 +31,21 @@ class LoopGuard:
             )
 
         if len(state.action_history) >= cls.MAX_SAME_ACTION_STREAK:
-            last_actions = [e.get("action", {}).get("type") for e in state.action_history[-cls.MAX_SAME_ACTION_STREAK:]]
-            if len(set(last_actions)) == 1:
-                raise LoopGuardError(
-                    f"Loop detectado: {cls.MAX_SAME_ACTION_STREAK} acciones consecutivas iguales ({last_actions[0]})."
-                )
+            last = state.action_history[-cls.MAX_SAME_ACTION_STREAK:]
+            last_types = [e.get("action", {}).get("type") for e in last]
+            if len(set(last_types)) == 1:
+                repeated_type = last_types[0]
+                # Evita falsos positivos: en desarrollo es normal tener varios file_write seguidos
+                if repeated_type in {"file_write", "file_modify"}:
+                    targets = [
+                        (e.get("action", {}).get("path") or "").strip().lower()
+                        for e in last
+                    ]
+                    if len(set(targets)) == 1 and targets[0]:
+                        raise LoopGuardError(
+                            f"Loop detectado: {cls.MAX_SAME_ACTION_STREAK} escrituras consecutivas sobre el mismo archivo ({targets[0]})."
+                        )
+                else:
+                    raise LoopGuardError(
+                        f"Loop detectado: {cls.MAX_SAME_ACTION_STREAK} acciones consecutivas iguales ({repeated_type})."
+                    )

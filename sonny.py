@@ -10,6 +10,9 @@ sys.stderr.reconfigure(line_buffering=True)
 from core.ai           import interpret, test_providers, active_provider
 from core.agent        import run_agent, es_tarea_agente
 from core.orchestrator import run_orchestrator_with_site, detectar_navegadores
+from core.loop_guard import LoopGuardError
+from core.validator import ValidationError
+from core.planner import PlannerError
 from core.ai_scraper   import shutdown_ai_scraper_runtime
 from core.launcher     import launch
 from core.registry     import get_all, item_type
@@ -179,7 +182,17 @@ def main():
                     preferred_ai = _ask_preferred_ai(preferred_ai_memory)
                 preferred_ai_memory = preferred_ai
                 print(f"  {C.DIM}IA seleccionada: {preferred_ai}{C.RESET}")
-                run_orchestrator_with_site(user_input, preferred_site=preferred_ai)
+                try:
+                    run_orchestrator_with_site(user_input, preferred_site=preferred_ai)
+                except LoopGuardError as exc:
+                    print(f"  {C.RED}❌ Ejecución detenida por loop_guard:{C.RESET} {exc}")
+                    print(f"  {C.DIM}Tip: pide menos archivos por fase o más comandos de build/test entre escrituras.{C.RESET}")
+                except ValidationError as exc:
+                    print(f"  {C.RED}❌ Validación bloqueó el plan/acciones:{C.RESET} {exc}")
+                except PlannerError as exc:
+                    print(f"  {C.RED}❌ Planner no pudo obtener JSON válido:{C.RESET} {exc}")
+                except Exception as exc:
+                    print(f"  {C.RED}❌ Error en orquestador:{C.RESET} {exc}")
                 continue
 
             if es_tarea_agente(user_input) and not modo_fuzzy:
