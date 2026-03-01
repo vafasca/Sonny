@@ -13,7 +13,7 @@ ai_scraper_stub.set_preferred_site = lambda site: None
 ai_scraper_stub.available_sites = lambda: ["chatgpt", "claude", "gemini", "qwen"]
 sys.modules["core.ai_scraper"] = ai_scraper_stub
 
-from core.agent import ExecutorError, execute_command, modify_file, write_file, _block_interactive_commands, ActionExecutor
+from core.agent import ExecutorError, execute_command, modify_file, write_file, _block_interactive_commands, ActionExecutor, _split_actions_into_subfases
 from core.orchestrator import _build_task_workspace, _parse_angular_cli_version, _snapshot_project_files, _strip_ansi, _build_angular_rules, _validate_action_consistency, _sanitize_project_name, _build_ng_new_command, _project_has_lint_target, _enforce_rigid_pipeline
 from core.state_manager import AgentState
 from core import planner as planner_mod
@@ -638,13 +638,15 @@ export class AppComponent {}""",
         self.assertEqual(state.phase_action_count, 1)
         self.assertEqual(len(state.action_history), 4)
 
-    def test_execute_actions_blocks_phase_with_too_many_actions(self):
+    def test_execute_actions_auto_splits_large_write_phase(self):
         base = Path(tempfile.mkdtemp(prefix="sonny_action_limit_"))
         task = base / "task_action_limit"
         task.mkdir(parents=True, exist_ok=True)
+        (task / "angular.json").write_text("{}", encoding="utf-8")
 
         state = AgentState()
         state.set_task_workspace(task)
+        state.set_project_root(task)
         state.set_phase("Fase extensa")
 
         actions = [
@@ -652,11 +654,22 @@ export class AppComponent {}""",
             for idx in range(6)
         ]
 
-        executor = ActionExecutor(workspace=task)
-        with self.assertRaises(ExecutorError):
-            executor.execute_actions({"actions": actions}, state)
+        commands: list[str] = []
+        original_run = agent_mod.subprocess.run
 
-        self.assertEqual(state.phase_action_count, 0)
+        def fake_run(cmd, shell, cwd, capture_output, text, timeout, encoding, errors):
+            commands.append(cmd)
+            return types.SimpleNamespace(returncode=0, stdout="ok", stderr="")
+
+        agent_mod.subprocess.run = fake_run
+        try:
+            executor = ActionExecutor(workspace=task)
+            results = executor.execute_actions({"actions": actions}, state)
+        finally:
+            agent_mod.subprocess.run = original_run
+
+        self.assertTrue(any(cmd == "ng build" for cmd in commands))
+        self.assertTrue(all(r.get("ok") for r in results))
 
     def test_project_has_lint_target_detection(self):
         base = Path(tempfile.mkdtemp(prefix="sonny_lint_target_"))
@@ -746,18 +759,28 @@ export class AppComponent {}""",
         self.assertTrue(any(cmd == "ng build" for cmd in commands))
         self.assertEqual(len(results), 3)
 
-    def test_execute_actions_blocks_too_many_consecutive_writes(self):
+    def test_execute_actions_auto_splits_consecutive_writes(self):
         base = Path(tempfile.mkdtemp(prefix="sonny_write_streak_"))
         task = base / "task_write_streak"
         task.mkdir(parents=True, exist_ok=True)
+        (task / "angular.json").write_text("{}", encoding="utf-8")
 
         state = AgentState()
         state.set_task_workspace(task)
+        state.set_project_root(task)
         state.set_phase("FASE 2 — IMPLEMENTACIÓN PROGRESIVA")
 
-        executor = ActionExecutor(workspace=task)
-        with self.assertRaises(ExecutorError):
-            executor.execute_actions(
+        commands: list[str] = []
+        original_run = agent_mod.subprocess.run
+
+        def fake_run(cmd, shell, cwd, capture_output, text, timeout, encoding, errors):
+            commands.append(cmd)
+            return types.SimpleNamespace(returncode=0, stdout="ok", stderr="")
+
+        agent_mod.subprocess.run = fake_run
+        try:
+            executor = ActionExecutor(workspace=task)
+            results = executor.execute_actions(
                 {
                     "actions": [
                         {"type": "file_write", "path": "src/app/a.ts", "content": "export const a=1;"},
@@ -768,6 +791,47 @@ export class AppComponent {}""",
                 },
                 state,
             )
+        finally:
+            agent_mod.subprocess.run = original_run
+
+        self.assertTrue(any(cmd == "ng build" for cmd in commands))
+        self.assertTrue(all(r.get("ok") for r in results))
+
+    def test_split_actions_into_subfases_injects_build_every_three_writes(self):
+        payload = {
+            "actions": [
+                {"type": "file_write", "path": "a.ts", "content": "x"},
+                {"type": "file_write", "path": "b.ts", "content": "x"},
+                {"type": "file_modify", "path": "c.ts", "content": "x"},
+                {"type": "file_write", "path": "d.ts", "content": "x"},
+            ]
+        }
+        subfases = _split_actions_into_subfases(payload)
+        self.assertEqual(len(subfases), 2)
+        self.assertEqual(subfases[0]["actions"][-1], {"type": "command", "command": "ng build"})
+
+    def test_execute_command_uses_longer_timeout_for_npm_install(self):
+        base = Path(tempfile.mkdtemp(prefix="sonny_npm_timeout_"))
+        task = base / "task_npm_timeout"
+        task.mkdir(parents=True, exist_ok=True)
+
+        state = AgentState()
+        state.set_task_workspace(task)
+
+        captured = {"timeout": None}
+        original_run = agent_mod.subprocess.run
+
+        def fake_run(cmd, shell, cwd, capture_output, text, timeout, encoding, errors):
+            captured["timeout"] = timeout
+            return types.SimpleNamespace(returncode=0, stdout="ok", stderr="")
+
+        agent_mod.subprocess.run = fake_run
+        try:
+            execute_command({"type": "command", "command": "npm install"}, {"workspace": task, "state": state})
+        finally:
+            agent_mod.subprocess.run = original_run
+
+        self.assertEqual(captured["timeout"], agent_mod.TIMEOUT_NPM_INSTALL)
 
 
 if __name__ == "__main__":

@@ -20,6 +20,7 @@ from core.pipeline_config import (
     MAX_FILE_WRITES_WITHOUT_BUILD,
     MAX_LLM_CALLS_PER_PHASE,
     REQUIRE_BUILD_AFTER_PHASE,
+    TIMEOUT_NPM_INSTALL,
 )
 from core.validator import validate_actions, ValidationError
 from core.web_log import log_action_blocked, log_error
@@ -97,6 +98,42 @@ def _inject_build_if_needed(actions_payload: dict) -> dict:
     return {"actions": [*actions, {"type": "command", "command": "ng build"}]}
 
 
+
+
+def _split_actions_into_subfases(actions_payload: dict) -> list[dict]:
+    actions = list(actions_payload.get("actions", []))
+    if not actions:
+        return [actions_payload]
+
+    subfases: list[dict] = []
+    current: list[dict] = []
+    write_streak = 0
+    split_needed = False
+
+    for action in actions:
+        current.append(action)
+        action_type = action.get("type")
+
+        if action_type in {"file_write", "file_modify"}:
+            write_streak += 1
+            if write_streak >= MAX_FILE_WRITES_WITHOUT_BUILD:
+                current.append({"type": "command", "command": "ng build"})
+                subfases.append({"actions": current})
+                current = []
+                write_streak = 0
+                split_needed = True
+            continue
+
+        if action_type == "command" and _is_build_command(action.get("command", "")):
+            write_streak = 0
+        elif action_type != "llm_call":
+            write_streak = 0
+
+    if current:
+        subfases.append({"actions": current})
+
+    return subfases if split_needed else [actions_payload]
+
 def _validate_consecutive_writes(actions_payload: dict) -> None:
     streak = 0
     for action in actions_payload.get("actions", []):
@@ -121,10 +158,22 @@ class ActionExecutor:
         self.workspace = (workspace or WORKSPACE_ROOT).resolve()
 
     def execute_actions(self, actions_payload: dict, state: AgentState) -> list[dict[str, Any]]:
-        validated_payload = _inject_build_if_needed(actions_payload)
-        _validate_phase_limits(validated_payload)
-        _validate_consecutive_writes(validated_payload)
-        return self._execute_actions(validated_payload, state, nested_depth=0)
+        all_results: list[dict[str, Any]] = []
+        subfases = _split_actions_into_subfases(actions_payload)
+
+        for idx, sub_payload in enumerate(subfases):
+            if idx > 0:
+                state.reset_phase()
+            validated_payload = _inject_build_if_needed(sub_payload)
+            _validate_phase_limits(validated_payload)
+            _validate_consecutive_writes(validated_payload)
+            sub_results = self._execute_actions(validated_payload, state, nested_depth=0)
+            all_results.extend(sub_results)
+
+            if any(not r.get("ok", False) for r in sub_results):
+                break
+
+        return all_results
 
     def _execute_actions(self, actions_payload: dict, state: AgentState, nested_depth: int) -> list[dict[str, Any]]:
         actions = actions_payload.get("actions", [])
@@ -474,7 +523,7 @@ def execute_command(action: dict, context: dict) -> dict:
         cwd=str(cwd),
         capture_output=True,
         text=True,
-        timeout=TIMEOUT_CMD,
+        timeout=TIMEOUT_NPM_INSTALL if re.search(r"(^|\s)npm\s+install(\s|$)", cmd, flags=re.IGNORECASE) else TIMEOUT_CMD,
         encoding="utf-8",
         errors="replace",
     )
