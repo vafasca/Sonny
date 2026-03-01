@@ -192,8 +192,24 @@ def _guard_angular_command(cmd: str, cwd: Path, state: AgentState | None, worksp
     )
 
 
+
+
+def _block_interactive_commands(cmd: str) -> None:
+    low = cmd.strip().lower()
+    blocked_prefixes = (
+        'ng serve',
+        'npm start',
+        'npm run start',
+    )
+    if any(low.startswith(prefix) for prefix in blocked_prefixes):
+        raise ExecutorError(
+            f"Comando interactivo bloqueado en modo automático: '{cmd}'. Usa ng build/ng test/ng e2e en su lugar."
+        )
+
+
 def execute_command(action: dict, context: dict) -> dict:
     cmd = action["command"]
+    _block_interactive_commands(cmd)
     state: AgentState | None = context.get("state")
     workspace = Path(context["workspace"]).resolve()
 

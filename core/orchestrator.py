@@ -24,7 +24,7 @@ class C:
     DIM="\033[2m"; RESET="\033[0m"
 
 
-def _run_cmd_utf8(cmd: str, cwd: Path | None = None) -> tuple[int, str]:
+def _run_cmd_utf8(cmd: str, cwd: Path | None = None, timeout: int = 30) -> tuple[int, str]:
     proc = subprocess.run(
         cmd,
         shell=True,
@@ -33,7 +33,7 @@ def _run_cmd_utf8(cmd: str, cwd: Path | None = None) -> tuple[int, str]:
         text=True,
         encoding="utf-8",
         errors="replace",
-        timeout=30,
+        timeout=timeout,
     )
     out = (proc.stdout or "") + ("\n" + proc.stderr if proc.stderr else "")
     return proc.returncode, out.strip()
@@ -200,6 +200,41 @@ def _failed_action_summaries(state: AgentState) -> list[dict]:
     return failed[-5:]
 
 
+
+
+def _run_quality_checks(project_root: Path) -> tuple[list[dict], list[dict]]:
+    """Ejecuta suite de validación solicitada (lint/test/build/e2e)."""
+    checks = [
+        ("ng lint", "Análisis Estático", 120),
+        ("ng test --no-watch --browsers=ChromeHeadless", "Pruebas Unitarias", 300),
+        ("ng build --configuration production", "Prueba de Compilación (AOT)", 300),
+        ("ng e2e", "Pruebas de Extremo a Extremo", 300),
+    ]
+
+    failures: list[dict] = []
+    reports: list[dict] = []
+
+    for cmd, check_type, timeout in checks:
+        code, out = _run_cmd_utf8(cmd, cwd=project_root, timeout=timeout)
+        report = {"command": cmd, "type": check_type, "ok": code == 0, "exit_code": code, "output": out[-4000:]}
+        reports.append(report)
+        if code != 0:
+            failures.append(report)
+
+    return failures, reports
+
+
+def _autofix_with_llm(
+    phase_name: str,
+    fix_context: dict,
+    executor: ActionExecutor,
+    state: AgentState,
+    preferred_site: str | None,
+) -> list[dict]:
+    actions_payload = get_phase_actions(phase_name, fix_context, preferred_site=preferred_site)
+    validate_actions(actions_payload)
+    return executor.execute_actions(actions_payload, state)
+
 def _sync_state_before_phase(state: AgentState, task_workspace: Path) -> None:
     if not state.current_workdir or not Path(state.current_workdir).exists():
         state.set_current_workdir(task_workspace)
@@ -308,6 +343,72 @@ def run_orchestrator(
         except Exception as exc:
             log_error("orchestrator", f"Error en fase '{phase_name}': {exc}")
             raise
+
+    # Validación final obligatoria para entregar aplicación funcionando.
+    if state.project_root and Path(state.project_root).exists():
+        print(f"  {C.CYAN}▶ Suite de calidad final en: {state.project_root}{C.RESET}")
+        max_fix_rounds = 2
+        for round_num in range(max_fix_rounds + 1):
+            failures, reports = _run_quality_checks(Path(state.project_root))
+            phase_results.append({
+                "phase": f"quality_checks_round_{round_num}",
+                "results": reports,
+                "cwd": str(state.project_root),
+                "project_root": str(state.project_root),
+            })
+            if not failures:
+                print(f"  {C.GREEN}✅ Suite de calidad aprobada (lint/test/build/e2e).{C.RESET}")
+                break
+            if round_num >= max_fix_rounds:
+                print(f"  {C.RED}❌ Persisten fallas tras auto-fix: {len(failures)} check(s).{C.RESET}")
+                break
+
+            print(f"  {C.YELLOW}⚠️ Fallaron {len(failures)} checks, solicitando auto-corrección al LLM...{C.RESET}")
+            fix_context = {
+                "user_request": user_request,
+                "phase": {
+                    "name": "Corrección automática de calidad",
+                    "description": "Corrige errores de lint/test/build/e2e usando solo rutas relativas y comandos no interactivos.",
+                    "depends_on": [phase_results[-1]["phase"]],
+                },
+                "completed_phases": state.completed_phases,
+                "action_history": state.action_history[-20:],
+                "failed_actions": _failed_action_summaries(state),
+                "failed_checks": failures,
+                "task_workspace": str(state.task_workspace) if state.task_workspace else "",
+                "current_workdir": str(state.current_workdir) if state.current_workdir else "",
+                "project_root": str(state.project_root) if state.project_root else "",
+                "angular_cli_version": state.angular_cli_version,
+                "angular_project_version": state.angular_project_version,
+                "runtime_env": runtime_env,
+                "project_structure": _snapshot_project_files(task_workspace, state.project_root)["structure"],
+                "existing_files": _snapshot_project_files(task_workspace, state.project_root)["existing"],
+                "missing_files": _snapshot_project_files(task_workspace, state.project_root)["missing"],
+                "valid_commands": [
+                    "ng lint",
+                    "ng test --no-watch --browsers=ChromeHeadless",
+                    "ng build --configuration production",
+                    "ng e2e",
+                ],
+                "forbidden_commands": ["ng serve", "npm start", "npm run start"],
+            }
+            try:
+                fix_results = _autofix_with_llm(
+                    "Corrección automática de calidad",
+                    fix_context,
+                    executor,
+                    state,
+                    preferred_site,
+                )
+                phase_results.append({
+                    "phase": f"quality_autofix_round_{round_num}",
+                    "results": fix_results,
+                    "cwd": str(state.current_workdir or state.project_root),
+                    "project_root": str(state.project_root) if state.project_root else "",
+                })
+            except Exception as exc:
+                log_error("orchestrator", f"Auto-fix de calidad falló: {exc}")
+                break
 
     return {
         "ok": True,

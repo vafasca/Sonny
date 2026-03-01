@@ -12,7 +12,7 @@ ai_scraper_stub.set_preferred_site = lambda site: None
 ai_scraper_stub.available_sites = lambda: ["chatgpt", "claude", "gemini", "qwen"]
 sys.modules["core.ai_scraper"] = ai_scraper_stub
 
-from core.agent import ExecutorError, execute_command, modify_file, write_file
+from core.agent import ExecutorError, execute_command, modify_file, write_file, _block_interactive_commands
 from core.orchestrator import _build_task_workspace, _parse_angular_cli_version
 from core.state_manager import AgentState
 
@@ -73,6 +73,11 @@ class TestExecutionPaths(unittest.TestCase):
         )
         self.assertTrue((task / "src" / "app" / "new.component.ts").exists())
         self.assertIn("warning", result)
+
+
+    def test_block_interactive_commands(self):
+        with self.assertRaises(ExecutorError):
+            _block_interactive_commands("ng serve --open")
 
     def test_ng_lint_requires_target(self):
         base = Path(tempfile.mkdtemp(prefix="sonny_lint_"))
