@@ -208,6 +208,22 @@ Package Manager   : npm 11.10.1
     def test_sanitize_project_name_keeps_ng_constraints(self):
         self.assertEqual(_sanitize_project_name("123__Hospital App!!!"), "app-123-hospital-app")
 
+    def test_validator_allows_typescript_with_header_comment_and_real_code(self):
+        payload = {
+            "actions": [
+                {
+                    "type": "file_write",
+                    "path": "src/app/app.component.ts",
+                    "content": """// Componente principal
+import { Component } from '@angular/core';
+
+@Component({selector: 'app-root', standalone: true, template: '<div></div>'})
+export class AppComponent {}""",
+                }
+            ]
+        }
+        validate_actions(payload)
+
     def test_validator_blocks_placeholder_typescript_content(self):
         payload = {
             "actions": [

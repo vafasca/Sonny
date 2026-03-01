@@ -192,14 +192,12 @@ def _validate_file_content(path: str, content: str) -> None:
     if not isinstance(content, str):
         raise ValidationError(f"Contenido inválido para '{path}': debe ser string.")
 
-    lowered = content.lower()
-    if any(hint in lowered for hint in PLACEHOLDER_HINTS):
-        raise ValidationError(f"Contenido placeholder detectado en '{path}'.")
-
     ext = path.lower().split('.')[-1] if '.' in path else ''
     stripped = content.strip()
     if not stripped:
         raise ValidationError(f"Contenido vacío detectado en '{path}'.")
+
+    lowered = stripped.lower()
 
     if ext in {"ts", "tsx", "js", "jsx"}:
         body = re.sub(r"/\*.*?\*/", "", stripped, flags=re.DOTALL)
@@ -208,16 +206,28 @@ def _validate_file_content(path: str, content: str) -> None:
             raise ValidationError(f"Contenido no sustantivo (solo comentarios) en '{path}'.")
         code_tokens = ("import ", "export ", "@component", "class ", "function ", "const ", "let ", "=>")
         if not any(token in body.lower() for token in code_tokens):
+            if any(hint in lowered for hint in PLACEHOLDER_HINTS):
+                raise ValidationError(f"Contenido placeholder detectado en '{path}'.")
             raise ValidationError(f"Contenido TypeScript/JavaScript sospechoso en '{path}'.")
+        return
 
     if ext in {"html", "htm"}:
         body = re.sub(r"<!--.*?-->", "", stripped, flags=re.DOTALL).strip()
         if not body:
             raise ValidationError(f"Contenido no sustantivo (solo comentarios) en '{path}'.")
         if not re.search(r"<\s*[a-zA-Z][^>]*>", body):
+            if any(hint in lowered for hint in PLACEHOLDER_HINTS):
+                raise ValidationError(f"Contenido placeholder detectado en '{path}'.")
             raise ValidationError(f"HTML inválido o vacío en '{path}'.")
+        return
 
     if ext in {"scss", "css"}:
         body = re.sub(r"/\*.*?\*/", "", stripped, flags=re.DOTALL).strip()
         if not re.search(r"[^{}]+\{[^{}]+\}", body):
+            if any(hint in lowered for hint in PLACEHOLDER_HINTS):
+                raise ValidationError(f"Contenido placeholder detectado en '{path}'.")
             raise ValidationError(f"CSS/SCSS sin reglas válidas en '{path}'.")
+        return
+
+    if any(hint in lowered for hint in PLACEHOLDER_HINTS):
+        raise ValidationError(f"Contenido placeholder detectado en '{path}'.")
