@@ -13,7 +13,7 @@ ai_scraper_stub.available_sites = lambda: ["chatgpt", "claude", "gemini", "qwen"
 sys.modules["core.ai_scraper"] = ai_scraper_stub
 
 from core.agent import ExecutorError, execute_command, modify_file, write_file, _block_interactive_commands
-from core.orchestrator import _build_task_workspace, _parse_angular_cli_version, _snapshot_project_files, _strip_ansi, _build_angular_rules
+from core.orchestrator import _build_task_workspace, _parse_angular_cli_version, _snapshot_project_files, _strip_ansi, _build_angular_rules, _validate_action_consistency, _sanitize_project_name
 from core.state_manager import AgentState
 from core import planner as planner_mod
 from core.validator import validate_actions, ValidationError
@@ -182,6 +182,22 @@ Package Manager   : npm 11.10.1
             ]
         }
         validate_actions(payload)
+
+    def test_action_consistency_blocks_app_module_in_standalone(self):
+        context = {
+            "project_structure": "standalone_components (NO NgModules)",
+            "existing_files": ["src/app/app.ts", "src/app/app.config.ts"],
+        }
+        payload = {
+            "actions": [
+                {"type": "file_write", "path": "src/app/app.module.ts", "content": "x"}
+            ]
+        }
+        with self.assertRaises(ValidationError):
+            _validate_action_consistency(payload, context)
+
+    def test_sanitize_project_name_keeps_ng_constraints(self):
+        self.assertEqual(_sanitize_project_name("123__Hospital App!!!"), "app-123-hospital-app")
 
     def test_task_workspace_isolation_unique_folders(self):
         a = _build_task_workspace("desarrolla una landing", None)

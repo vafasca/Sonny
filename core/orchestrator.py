@@ -121,6 +121,50 @@ def _slugify_request(text: str) -> str:
     return cleaned[:48] or "task"
 
 
+def _is_angular_request(user_request: str) -> bool:
+    low = (user_request or "").lower()
+    tokens = ("angular", "ng ", "ngnew", "landing page", "landing")
+    return any(token in low for token in tokens)
+
+
+def _sanitize_project_name(seed: str) -> str:
+    base = re.sub(r"[^a-z0-9-]+", "-", (seed or "hospital-landing").lower()).strip("-")
+    if not base:
+        base = "hospital-landing"
+    if not re.match(r"^[a-z]", base):
+        base = f"app-{base}"
+    return base[:40].rstrip("-") or "hospital-landing"
+
+
+def _ensure_angular_project_initialized(task_workspace: Path, state: AgentState, user_request: str) -> Path | None:
+    existing_root = _find_angular_root(task_workspace)
+    if existing_root:
+        state.set_project_root(existing_root)
+        state.angular_project_version = _angular_project_version(existing_root)
+        state.set_current_workdir(existing_root)
+        return existing_root
+
+    if not _is_angular_request(user_request):
+        return None
+
+    if (state.angular_cli_version or "").strip() in {"unknown", "not_installed", ""}:
+        print(f"  {C.YELLOW}⚠️ Angular CLI no disponible; no se puede inicializar proyecto automáticamente.{C.RESET}")
+        return None
+
+    project_name = _sanitize_project_name(_slugify_request(user_request))
+    cmd = f"ng new {project_name} --routing --style=scss --skip-git --defaults --interactive=false"
+    print(f"  {C.CYAN}▶ Inicializando proyecto Angular base: {project_name}{C.RESET}")
+    code, out = _run_cmd_utf8(cmd, cwd=task_workspace, timeout=900)
+    if code != 0:
+        raise RuntimeError(f"No se pudo inicializar proyecto Angular base con ng new: {out[-1000:]}")
+
+    project_root = (task_workspace / project_name).resolve()
+    state.set_project_root(project_root)
+    state.angular_project_version = _angular_project_version(project_root)
+    state.set_current_workdir(project_root)
+    return project_root
+
+
 def _build_task_workspace(user_request: str, workspace: Path | None) -> Path:
     if workspace is not None:
         root = Path(workspace)
@@ -321,6 +365,20 @@ def _build_angular_rules(project_structure: str, project_version: str) -> list[s
     ]
     return rules
 
+def _validate_action_consistency(actions_payload: dict, context: dict) -> None:
+    structure = context.get("project_structure", "unknown")
+    existing = set(context.get("existing_files", []) or [])
+
+    for action in actions_payload.get("actions", []):
+        if action.get("type") not in {"file_write", "file_modify"}:
+            continue
+        path = str(action.get("path", "")).replace("\\", "/")
+        if structure == "standalone_components (NO NgModules)" and path.endswith("src/app/app.module.ts") and "src/app/app.module.ts" not in existing:
+            raise ValidationError(
+                "Acción inválida para standalone: no crees app.module.ts si no existe en el árbol real."
+            )
+
+
 def run_orchestrator(
     user_request: str,
     workspace: Path | None = None,
@@ -336,6 +394,8 @@ def run_orchestrator(
     executor = ActionExecutor(workspace=task_workspace)
     print(f"  {C.DIM}Workspace de tarea: {task_workspace}{C.RESET}")
     print(f"  {C.DIM}Angular CLI global: {state.angular_cli_version}{C.RESET}")
+
+    _ensure_angular_project_initialized(task_workspace, state, user_request)
 
     master_plan: dict | None = None
     for _ in range(2):
@@ -389,6 +449,7 @@ def run_orchestrator(
         try:
             actions_payload = get_phase_actions(phase_name, context, preferred_site=preferred_site)
             validate_actions(actions_payload)
+            _validate_action_consistency(actions_payload, context)
         except ValidationError as exc:
             log_validation_failed(f"acciones:{phase_name}", str(exc))
             log_action_blocked("phase_actions", str(exc))
