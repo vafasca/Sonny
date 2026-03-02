@@ -15,13 +15,20 @@ from core.action_registry import ALLOWED_ACTIONS
 from core.ai_scraper import call_llm
 from core.state_manager import AgentState
 from core.loop_guard import LoopGuard, LoopGuardError
+from core.pipeline_config import (
+    MAX_ACTIONS_PER_PHASE,
+    MAX_FILE_WRITES_WITHOUT_BUILD,
+    MAX_LLM_CALLS_PER_PHASE,
+    REQUIRE_BUILD_AFTER_PHASE,
+    TIMEOUT_NPM_INSTALL,
+)
 from core.validator import validate_actions, ValidationError
 from core.web_log import log_action_blocked, log_error
 
 WORKSPACE_ROOT = Path(__file__).parent.parent / "workspace"
 WORKSPACE_ROOT.mkdir(parents=True, exist_ok=True)
 TIMEOUT_CMD = 120
-MAX_NESTED_LLM_CALLS = 2
+MAX_NESTED_LLM_CALLS = 1
 MAX_CONTEXT_FILE_BYTES = 3000
 MAX_CONTEXT_FILES = 8
 MAX_CONTEXT_TOTAL_BYTES = 12000
@@ -41,12 +48,132 @@ def es_tarea_agente(texto: str) -> bool:
     return any(trigger in low for trigger in TRIGGERS_AGENTE)
 
 
+
+
+def _is_build_command(command: str) -> bool:
+    low = (command or "").strip().lower()
+    return low.startswith("ng build")
+
+
+def _count_actions(payload: dict, action_type: str) -> int:
+    return sum(1 for a in payload.get("actions", []) if a.get("type") == action_type)
+
+
+def _validate_phase_limits(actions_payload: dict) -> None:
+    actions = list(actions_payload.get("actions", []))
+    if len(actions) > MAX_ACTIONS_PER_PHASE:
+        raise ExecutorError(
+            f"Fase bloqueada: {len(actions)} acciones exceden el máximo ({MAX_ACTIONS_PER_PHASE})."
+        )
+
+    llm_calls = _count_actions(actions_payload, "llm_call")
+    if llm_calls > MAX_LLM_CALLS_PER_PHASE:
+        raise ExecutorError(
+            f"Fase bloqueada: {llm_calls} llm_call exceden el máximo ({MAX_LLM_CALLS_PER_PHASE})."
+        )
+
+
+def _phase_requires_build(actions_payload: dict) -> bool:
+    has_structural_change = any(
+        a.get("type") in {"file_write", "file_modify"}
+        for a in actions_payload.get("actions", [])
+    )
+    has_build = any(
+        a.get("type") == "command" and _is_build_command(a.get("command", ""))
+        for a in actions_payload.get("actions", [])
+    )
+    return REQUIRE_BUILD_AFTER_PHASE and has_structural_change and not has_build
+
+
+def _inject_build_if_needed(actions_payload: dict) -> dict:
+    if not _phase_requires_build(actions_payload):
+        return actions_payload
+
+    actions = list(actions_payload.get("actions", []))
+    if len(actions) >= MAX_ACTIONS_PER_PHASE:
+        raise ExecutorError(
+            "Fase bloqueada: se requiere ng build por cambios estructurales y no hay espacio por límite de acciones."
+        )
+
+    return {"actions": [*actions, {"type": "command", "command": "ng build"}]}
+
+
+
+
+def _split_actions_into_subfases(actions_payload: dict) -> list[dict]:
+    actions = list(actions_payload.get("actions", []))
+    if not actions:
+        return [actions_payload]
+
+    subfases: list[dict] = []
+    current: list[dict] = []
+    write_streak = 0
+    split_needed = False
+
+    for action in actions:
+        current.append(action)
+        action_type = action.get("type")
+
+        if action_type in {"file_write", "file_modify"}:
+            write_streak += 1
+            if write_streak >= MAX_FILE_WRITES_WITHOUT_BUILD:
+                current.append({"type": "command", "command": "ng build"})
+                subfases.append({"actions": current})
+                current = []
+                write_streak = 0
+                split_needed = True
+            continue
+
+        if action_type == "command" and _is_build_command(action.get("command", "")):
+            write_streak = 0
+        elif action_type != "llm_call":
+            write_streak = 0
+
+    if current:
+        subfases.append({"actions": current})
+
+    return subfases if split_needed else [actions_payload]
+
+def _validate_consecutive_writes(actions_payload: dict) -> None:
+    streak = 0
+    for action in actions_payload.get("actions", []):
+        t = action.get("type")
+        if t in {"file_write", "file_modify"}:
+            streak += 1
+            if streak > MAX_FILE_WRITES_WITHOUT_BUILD:
+                raise ExecutorError(
+                    f"Fase bloqueada: más de {MAX_FILE_WRITES_WITHOUT_BUILD} escrituras consecutivas sin build."
+                )
+            continue
+
+        if t == "command" and _is_build_command(action.get("command", "")):
+            streak = 0
+            continue
+
+        if t != "llm_call":
+            streak = 0
+
 class ActionExecutor:
     def __init__(self, workspace: Path | None = None):
         self.workspace = (workspace or WORKSPACE_ROOT).resolve()
 
     def execute_actions(self, actions_payload: dict, state: AgentState) -> list[dict[str, Any]]:
-        return self._execute_actions(actions_payload, state, nested_depth=0)
+        all_results: list[dict[str, Any]] = []
+        subfases = _split_actions_into_subfases(actions_payload)
+
+        for idx, sub_payload in enumerate(subfases):
+            if idx > 0:
+                state.reset_phase()
+            validated_payload = _inject_build_if_needed(sub_payload)
+            _validate_phase_limits(validated_payload)
+            _validate_consecutive_writes(validated_payload)
+            sub_results = self._execute_actions(validated_payload, state, nested_depth=0)
+            all_results.extend(sub_results)
+
+            if any(not r.get("ok", False) for r in sub_results):
+                break
+
+        return all_results
 
     def _execute_actions(self, actions_payload: dict, state: AgentState, nested_depth: int) -> list[dict[str, Any]]:
         actions = actions_payload.get("actions", [])
@@ -122,6 +249,32 @@ def _parse_nested_actions_payload(raw: str) -> dict | None:
     return None
 
 
+
+
+def _is_ignored_context_path(rel_path: str) -> bool:
+    norm = str(rel_path or "").replace("\\", "/").lower()
+    ignored_parts = ("node_modules/", ".angular/", "dist/", ".git/")
+    return any(part in norm for part in ignored_parts)
+
+
+def _priority_context_paths(project_root: Path) -> list[str]:
+    preferred = [
+        "src/main.ts",
+        "src/app/app.ts",
+        "src/app/app.html",
+        "src/app/app.config.ts",
+        "src/app/app.routes.ts",
+        "src/styles.scss",
+        "angular.json",
+        "package.json",
+    ]
+    out: list[str] = []
+    for rel in preferred:
+        full = (project_root / rel).resolve()
+        if full.exists() and full.is_file():
+            out.append(rel)
+    return out
+
 def _collect_project_file_context(prompt: str, state: AgentState | None) -> str:
     if state is None or not state.project_root:
         return ""
@@ -152,9 +305,11 @@ def _collect_project_file_context(prompt: str, state: AgentState | None) -> str:
         if any(kw in low for kw in keywords):
             selected_exts.update(exts)
 
-    candidate_rel_paths: list[str] = []
+    candidate_rel_paths: list[str] = _priority_context_paths(project_root)
     if selected_exts:
-        for file in sorted(project_root.rglob("*")):
+        app_dir = project_root / "src" / "app"
+        scan_root = app_dir if app_dir.exists() else project_root
+        for file in sorted(scan_root.rglob("*")):
             if not file.is_file():
                 continue
             if file.suffix.lower() not in selected_exts:
@@ -163,16 +318,21 @@ def _collect_project_file_context(prompt: str, state: AgentState | None) -> str:
                 rel = file.relative_to(project_root)
             except ValueError:
                 continue
-            candidate_rel_paths.append(str(rel).replace("\\", "/"))
+            rel_norm = str(rel).replace("\\", "/")
+            if _is_ignored_context_path(rel_norm):
+                continue
+            candidate_rel_paths.append(rel_norm)
 
     # Si el prompt menciona rutas explícitas, priorizarlas.
     explicit_paths = re.findall(r"(?:src/[\w\-./]+\.(?:ts|html|scss|css|md))", prompt or "", flags=re.IGNORECASE)
-    candidate_rel_paths.extend(explicit_paths)
+    candidate_rel_paths = [*explicit_paths, *candidate_rel_paths]
 
     selected: list[str] = []
     seen = set()
     for rel in candidate_rel_paths:
         norm = rel.replace("\\", "/")
+        if _is_ignored_context_path(norm):
+            continue
         if norm in seen:
             continue
         seen.add(norm)
@@ -211,7 +371,7 @@ def _collect_project_file_context(prompt: str, state: AgentState | None) -> str:
             tree = [
                 str(p.relative_to(project_root)).replace("\\", "/")
                 for p in sorted(app_dir.rglob("*"))
-                if p.is_file()
+                if p.is_file() and not _is_ignored_context_path(str(p.relative_to(project_root)).replace("\\", "/"))
             ]
             if tree:
                 blocks.append(
@@ -396,7 +556,7 @@ def execute_command(action: dict, context: dict) -> dict:
         cwd=str(cwd),
         capture_output=True,
         text=True,
-        timeout=TIMEOUT_CMD,
+        timeout=TIMEOUT_NPM_INSTALL if re.search(r"(^|\s)npm\s+install(\s|$)", cmd, flags=re.IGNORECASE) else TIMEOUT_CMD,
         encoding="utf-8",
         errors="replace",
     )

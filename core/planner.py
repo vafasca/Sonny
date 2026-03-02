@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import re
 from core.ai_scraper import call_llm, get_preferred_site, set_preferred_site
+from core.pipeline_config import MAX_ACTIONS_PER_PHASE, MAX_LLM_CALLS_PER_PHASE, MAX_FILE_WRITES_WITHOUT_BUILD
 
 MAX_RETRIES = 3
 
@@ -65,8 +66,6 @@ def _repair_unescaped_content_quotes(text: str) -> str:
 
         end_q = -1
         if j < len(src) and src[j] in '{[':
-            # Si content empieza con objeto/lista serializado dentro del string,
-            # buscamos el cierre balanceado y luego la comilla del string.
             opener = src[j]
             closer = '}' if opener == '{' else ']'
             balance = 0
@@ -86,7 +85,6 @@ def _repair_unescaped_content_quotes(text: str) -> str:
                             break
                 scan += 1
         else:
-            # fallback general
             scan = j
             while scan < len(src):
                 if src[scan] == '"':
@@ -162,7 +160,13 @@ def _ask_json(prompt: str, preferred_site: str | None = None) -> dict:
 
 def get_master_plan(user_request: str, preferred_site: str | None = None) -> dict:
     prompt = (
-        "Genera un plan maestro para ejecutar la solicitud del usuario.\n"
+        "Genera un plan maestro para ejecutar la solicitud del usuario con fases rígidas y validación incremental.\n"
+        "Incluye exactamente estas fases (puedes agregar subfases internas si hace falta):\n"
+        "1) FASE 1 — ESTRUCTURA ARQUITECTÓNICA\n"
+        "2) FASE 2 — IMPLEMENTACIÓN PROGRESIVA\n"
+        "3) FASE 3 — ACCESIBILIDAD Y SEO\n"
+        "4) FASE 4 — OPTIMIZACIÓN\n"
+        "5) FASE 5 — QUALITY CHECK FINAL\n"
         "Formato obligatorio:\n"
         "{\n"
         '  "phases": [\n'
@@ -174,6 +178,95 @@ def get_master_plan(user_request: str, preferred_site: str | None = None) -> dic
     return _ask_json(prompt, preferred_site=preferred_site)
 
 
+def _phase_constraints_text(phase_name: str, context: dict) -> str:
+    low = (phase_name or "").lower()
+    generic = (
+        "LÍMITES OBLIGATORIOS DEL PIPELINE:\n"
+        f"- Máximo {MAX_ACTIONS_PER_PHASE} acciones por fase/subfase.\n"
+        f"- Máximo {MAX_LLM_CALLS_PER_PHASE} llm_call por fase/subfase.\n"
+        f"- Máximo {MAX_FILE_WRITES_WITHOUT_BUILD} escrituras consecutivas (file_write/file_modify) sin build intermedio.\n"
+        "- Debes evaluar el estado actual del proyecto antes de proponer nuevas acciones.\n"
+        "- Prioriza arquitectura antes que diseño visual.\n"
+        "- Si la fase es grande, divídela en subfases controladas.\n"
+    )
+
+    if "fase 1" in low or "estructura" in low:
+        return generic + (
+            "REGLAS FASE 1 — ESTRUCTURA ARQUITECTÓNICA:\n"
+            "- Solo crear o validar estructura base.\n"
+            "- NO generar diseño visual.\n"
+            "- Para Angular standalone: crear componentes standalone vacíos; prohibido NgModule/app.module.ts/loadChildren.\n"
+            "- Incluye ng build al cerrar la fase.\n"
+        )
+
+    if "fase 2" in low or "implementación" in low:
+        return generic + (
+            "REGLAS FASE 2 — IMPLEMENTACIÓN PROGRESIVA:\n"
+            "- Modificar máximo 2 componentes por subfase.\n"
+            "- No modificar más de 3 archivos antes de compilar.\n"
+            "- Después de cada subfase, incluir ng build.\n"
+            "- Prohibido más de una llm_call anidada.\n"
+        )
+
+    if "fase 3" in low or "accesibilidad" in low or "seo" in low:
+        return generic + (
+            "REGLAS FASE 3 — ACCESIBILIDAD Y SEO:\n"
+            "- Solo tocar index.html, atributos semánticos, meta tags, aria-label y alt.\n"
+            "- No modificar arquitectura base.\n"
+            "- Incluye ng build al finalizar.\n"
+        )
+
+    if "fase 4" in low or "optimización" in low:
+        return generic + (
+            "REGLAS FASE 4 — OPTIMIZACIÓN:\n"
+            "- Solo optimizar si existen rutas reales detectadas.\n"
+            "- Evita complejidad innecesaria.\n"
+            "- Incluye ng build al finalizar.\n"
+        )
+
+    if "fase 5" in low or "quality" in low:
+        return generic + (
+            "REGLAS FASE 5 — QUALITY CHECK FINAL:\n"
+            "- Prioriza ng build --configuration production.\n"
+            "- Reporta warnings y evita comandos prohibidos.\n"
+        )
+
+    return generic
+
+
+def _render_project_tree(app_tree: list[str]) -> str:
+    if not app_tree:
+        return "src/\n └── app/\n     └── (sin archivos detectados)"
+
+    lines = ["src/", " └── app/"]
+    app_only = []
+    for item in app_tree:
+        norm = str(item).replace('\\', '/').strip('/')
+        if not norm.startswith('src/app/'):
+            continue
+        app_only.append(norm.replace('src/app/', ''))
+
+    app_only = sorted(dict.fromkeys(app_only))
+    if not app_only:
+        return "src/\n └── app/\n     └── (sin archivos detectados)"
+
+    for idx, rel in enumerate(app_only):
+        branch = " └──" if idx == len(app_only) - 1 else " ├──"
+        lines.append(f"     {branch} {rel}")
+    return "\n".join(lines)
+
+
+def _extra_forbidden_for_standalone(structure: str) -> list[str]:
+    if "standalone" not in (structure or "").lower():
+        return []
+    return [
+        "app.module.ts",
+        "NgModules",
+        "Archivos de bootstrap",
+        "loadChildren",
+    ]
+
+
 def get_phase_actions(phase_name: str, context: dict, preferred_site: str | None = None) -> dict:
     existing = _dedupe_keep_order(list(context.get("existing_files", []) or []), 40)
     missing = _dedupe_keep_order(list(context.get("missing_files", []) or []), 40)
@@ -182,60 +275,14 @@ def get_phase_actions(phase_name: str, context: dict, preferred_site: str | None
     deprecated = _dedupe_keep_order(list(context.get("deprecated_commands", []) or []), 20)
     angular_rules = _dedupe_keep_order(list(context.get("angular_rules", []) or []), 30)
     runtime = context.get("runtime_env", {})
+    structure = context.get("project_structure", "unknown")
 
-    divider = "─" * 70
-    project_block = (
-        f"\n{divider}\n"
-        "CONTEXTO DEL PROYECTO ANGULAR:\n"
-        f"{divider}\n"
-        f"Angular CLI global: {context.get('angular_cli_version', 'unknown')}\n"
-        f"Angular del proyecto: {context.get('angular_project_version', 'unknown')}\n"
-        f"Node: {runtime.get('node', 'unknown')} / npm: {runtime.get('npm', 'unknown')} / SO: {runtime.get('os', 'unknown')}\n"
-        f"Estructura: {context.get('project_structure', 'unknown')}\n"
-        f"Task workspace: {context.get('task_workspace', '')}\n"
-        f"Project root: {context.get('project_root', '')}\n"
-        f"Current workdir: {context.get('current_workdir', '')}\n"
-        "\nARCHIVOS QUE EXISTEN (puedes modificar):\n"
-        + "\n".join(f"• {f}" for f in existing)
-        + "\n\nARCHIVOS QUE NO EXISTEN (NO intentes modificar, usa file_write):\n"
-        + "\n".join(f"• {f}" for f in missing)
-        + "\n\nÁRBOL REAL src/app (escaneado):\n"
-        + ("\n".join(f"• {f}" for f in app_tree) if app_tree else "• (vacío/no detectado)")
-        + "\n\nCOMANDOS VÁLIDOS:\n"
-        + "\n".join(f"• {c}" for c in valid_commands)
-        + "\n\nCOMANDOS DEPRECADOS/NO USAR:\n"
-        + "\n".join(f"• {c}" for c in deprecated)
-        + "\n\nREGLAS ANGULAR:\n"
-        + "\n".join(f"• {r}" for r in angular_rules)
-        + f"\n{divider}\n"
-    )
-
-    exec_rules = (
-        "Reglas de ejecución:\n"
-        "- Usa rutas RELATIVAS lógicas al proyecto (ej: src/app/app.ts).\n"
-        "- NO uses rutas absolutas.\n"
-        "- El executor resolverá rutas absolutas de forma segura.\n"
-        "- Si archivo no existe, usa file_write en vez de file_modify.\n"
-        "- No uses ng serve/npm start en modo automático.\n"
-        "\nREGLAS CRÍTICAS PARA EL CAMPO \"content\":\n"
-        "- SIEMPRE debe contener código fuente COMPLETO listo para escribirse en disco.\n"
-        "- Si es .scss → selectores CSS reales. Ejemplo: body { margin: 0; }\n"
-        "- Si es .ts   → código TypeScript Angular compilable.\n"
-        "- Si es .html → markup HTML/Angular válido.\n"
-        "- Si es .md   → texto y markdown libremente.\n"
-        "\nPROHIBIDO en \"content\" para .scss, .ts y .html:\n"
-        "- Texto descriptivo (\"Agregar X, hacer Y...\").\n"
-        "- Instrucciones en lenguaje natural.\n"
-        "- Comentarios sin código real.\n"
-        "\n❌ MAL: \"content\": \"Agregar focus-visible a botones...\"\n"
-        "✅ BIEN: \"content\": \":focus-visible { outline: 3px solid #667EEA; }\"\n"
-    )
-
-
+    no_create = _dedupe_keep_order(_extra_forbidden_for_standalone(structure), 10)
+    tree_view = _render_project_tree(app_tree)
 
     prompt = (
-        f"Genera acciones para la fase '{phase_name}'.\n"
-        "Formato obligatorio:\n"
+        f"Genera acciones para la fase en base a mi estructura actual '{phase_name}'.\n"
+        "Responde SOLO con JSON válido con este formato:\n"
         "{\n"
         '  "actions": [\n'
         '    {"type": "command", "command": "..."},\n'
@@ -243,10 +290,60 @@ def get_phase_actions(phase_name: str, context: dict, preferred_site: str | None
         '    {"type": "file_modify", "path": "...", "content": "..."},\n'
         '    {"type": "llm_call", "prompt": "..."}\n'
         "  ]\n"
-        "}\n"
-        f"{project_block}\n"
-        f"{exec_rules}"
+        "}\n\n"
+        "────────────────────────────────────\n"
+        "CONTEXTO DETECTADO AUTOMÁTICAMENTE\n"
+        "────────────────────────────────────\n"
+        f"Angular CLI: {context.get('angular_cli_version', 'unknown')}\n"
+        f"Angular: {context.get('angular_project_version', 'unknown')}\n"
+        f"Node: {runtime.get('node', 'unknown')}\n"
+        f"Arquitectura: {structure}\n"
+        "\nEstructura actual:\n\n"
+        f"{tree_view}\n\n"
+        "Archivos existentes (puedes modificar):\n"
+        + "\n".join(f"- {f}" for f in existing)
+        + "\n\nArchivos faltantes (si los necesitas, usa file_write):\n"
+        + "\n".join(f"- {f}" for f in missing)
+        + "\n\n"
     )
+
+    if no_create:
+        prompt += "NO crear:\n" + "\n".join(f"- {item}" for item in no_create) + "\n\n"
+
+    prompt += (
+        "────────────────────────────────────\n"
+        f"REGLAS {phase_name}\n"
+        "────────────────────────────────────\n"
+        f"{_phase_constraints_text(phase_name, context)}\n"
+        "────────────────────────────────────\n"
+        "LÍMITES DEL PIPELINE\n"
+        "────────────────────────────────────\n"
+        f"- Máx {MAX_ACTIONS_PER_PHASE} acciones.\n"
+        f"- Máx {MAX_FILE_WRITES_WITHOUT_BUILD} escrituras consecutivas sin ng build.\n"
+        f"- Máx {MAX_LLM_CALLS_PER_PHASE} llm_call.\n"
+        "- Usar rutas relativas.\n"
+        "- Incluir ng build al cerrar cambios estructurales.\n\n"
+        "────────────────────────────────────\n"
+        "REGLAS DE GENERACIÓN DE ARTEFACTOS ANGULAR\n"
+        "────────────────────────────────────\n"
+        "- Si necesitas crear componente/servicio/pipe/módulo/directiva, decide y usa el comando Angular adecuado (ng generate o ng g).\n"
+        "- Para componentes en src/app/components, no dejes solo el .ts sin .html y .scss/.css.\n\n"
+        "────────────────────────────────────\n"
+        "REGLAS DEL CAMPO \"content\"\n"
+        "────────────────────────────────────\n"
+        "- Debe contener código fuente completo y compilable.\n"
+        "- No incluir texto descriptivo.\n"
+        "- Si archivo no existe, usa file_write en vez de file_modify.\n"
+        "- No uses ng serve/npm start en modo automático.\n"
+    )
+
+    if valid_commands:
+        prompt += "\nComandos válidos:\n" + "\n".join(f"- {c}" for c in valid_commands)
+    if deprecated:
+        prompt += "\n\nComandos no usar:\n" + "\n".join(f"- {c}" for c in deprecated)
+    if angular_rules:
+        prompt += "\n\nReglas angular adicionales:\n" + "\n".join(f"- {r}" for r in angular_rules)
+
 
     forbidden = _dedupe_keep_order(list(context.get("forbidden_commands", []) or []), 30)
     if forbidden:
@@ -265,4 +362,41 @@ def get_phase_actions(phase_name: str, context: dict, preferred_site: str | None
             )
         )
 
+    return _ask_json(prompt, preferred_site=preferred_site)
+
+
+def get_corrected_phase_actions(
+    phase_name: str,
+    previous_actions_payload: dict,
+    validation_error: str,
+    context: dict,
+    preferred_site: str | None = None,
+) -> dict:
+    runtime = context.get("runtime_env", {})
+    structure = context.get("project_structure", "unknown")
+    existing = _dedupe_keep_order(list(context.get("existing_files", []) or []), 30)
+    app_tree = _dedupe_keep_order(list(context.get("app_tree", []) or []), 60)
+
+    prev_json = json.dumps(previous_actions_payload, ensure_ascii=False, indent=2)
+    prompt = (
+        f"La acción anterior fue bloqueada en la fase '{phase_name}' por esta razón:\n"
+        f"- {validation_error}\n\n"
+        "Corrige únicamente las acciones inválidas. Mantén el resto si son válidas.\n"
+        "No cambies formato JSON ni tipos de acción.\n"
+        "No asumas archivos inexistentes. Respeta nombres detectados (ej: app.ts, app.html, app.scss).\n"
+        "Si estructura es standalone, no crees app.module.ts ni NgModules.\n"
+        "Si tocas app.config.ts en standalone: exporta ApplicationConfig e incluye provideRouter(routes).\n"
+        "Si archivo no existe, usa file_write; si existe, file_modify.\n\n"
+        "CONTEXTO MÍNIMO:\n"
+        f"- Arquitectura: {structure}\n"
+        f"- Angular: {context.get('angular_project_version', 'unknown')}\n"
+        f"- Node: {runtime.get('node', 'unknown')}\n"
+        "- Archivos existentes:\n"
+        + "\n".join(f"  • {f}" for f in existing)
+        + "\n- Árbol src/app:\n"
+        + ("\n".join(f"  • {f}" for f in app_tree) if app_tree else "  • (vacío/no detectado)")
+        + "\n\nACCIONES PREVIAS (JSON):\n"
+        + prev_json
+        + "\n\nResponde SOLO con JSON válido con formato {\"actions\": [...]}"
+    )
     return _ask_json(prompt, preferred_site=preferred_site)

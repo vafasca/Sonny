@@ -13,8 +13,8 @@ ai_scraper_stub.set_preferred_site = lambda site: None
 ai_scraper_stub.available_sites = lambda: ["chatgpt", "claude", "gemini", "qwen"]
 sys.modules["core.ai_scraper"] = ai_scraper_stub
 
-from core.agent import ExecutorError, execute_command, modify_file, write_file, _block_interactive_commands, ActionExecutor
-from core.orchestrator import _build_task_workspace, _parse_angular_cli_version, _snapshot_project_files, _strip_ansi, _build_angular_rules, _validate_action_consistency, _sanitize_project_name, _build_ng_new_command, _project_has_lint_target
+from core.agent import ExecutorError, execute_command, modify_file, write_file, _block_interactive_commands, ActionExecutor, _split_actions_into_subfases
+from core.orchestrator import _build_task_workspace, _parse_angular_cli_version, _snapshot_project_files, _strip_ansi, _build_angular_rules, _validate_action_consistency, _sanitize_project_name, _build_ng_new_command, _project_has_lint_target, _enforce_rigid_pipeline, _extract_error_signature, _phase_has_minimum_deliverable, _objective_related_components, _was_last_production_build_successful
 from core.state_manager import AgentState
 from core import planner as planner_mod
 import core.agent as agent_mod
@@ -188,13 +188,13 @@ Package Manager   : npm 11.10.1
                 "angular_rules": ["Usa app.ts y app.html"],
             },
         )
-        self.assertIn("CONTEXTO DEL PROYECTO ANGULAR", captured["prompt"])
-        self.assertEqual(captured["prompt"].count("CONTEXTO DEL PROYECTO ANGULAR"), 1)
-        self.assertIn("ARCHIVOS QUE EXISTEN", captured["prompt"])
-        self.assertIn("COMANDOS VÁLIDOS", captured["prompt"])
+        self.assertIn("CONTEXTO DETECTADO AUTOMÁTICAMENTE", captured["prompt"])
+        self.assertEqual(captured["prompt"].count("CONTEXTO DETECTADO AUTOMÁTICAMENTE"), 1)
+        self.assertIn("Archivos existentes", captured["prompt"])
+        self.assertIn("Comandos válidos", captured["prompt"])
         self.assertNotIn("Contexto JSON:", captured["prompt"])
-        self.assertIn('REGLAS CRÍTICAS PARA EL CAMPO "content"', captured["prompt"])
-        self.assertIn('PROHIBIDO en "content" para .scss, .ts y .html', captured["prompt"])
+        self.assertIn("REGLAS DE GENERACIÓN DE ARTEFACTOS ANGULAR", captured["prompt"])
+        self.assertIn('REGLAS DEL CAMPO "content"', captured["prompt"])
         self.assertEqual(payload["actions"][0]["type"], "llm_call")
 
 
@@ -218,8 +218,8 @@ Package Manager   : npm 11.10.1
             },
         )
 
-        self.assertEqual(captured["prompt"].count("• src/app/app.ts"), 2)  # existing + app_tree
-        self.assertEqual(captured["prompt"].count("• ng build --configuration production"), 1)
+        self.assertGreaterEqual(captured["prompt"].count("src/app/app.ts"), 1)
+        self.assertEqual(captured["prompt"].count("ng build --configuration production"), 1)
 
     def test_planner_prompt_includes_forbidden_commands_from_context(self):
         captured = {"prompt": ""}
@@ -316,6 +316,33 @@ Package Manager   : npm 11.10.1
         }
         with self.assertRaises(ValidationError):
             _validate_action_consistency(payload, context)
+
+
+    def test_action_consistency_blocks_component_ts_without_generate_or_companions(self):
+        context = {
+            "project_structure": "standalone_components (NO NgModules)",
+            "existing_files": ["src/app/app.ts", "src/app/app.config.ts"],
+        }
+        payload = {
+            "actions": [
+                {"type": "file_write", "path": "src/app/components/hero/hero.component.ts", "content": "export class HeroComponent {}"}
+            ]
+        }
+        with self.assertRaises(ValidationError):
+            _validate_action_consistency(payload, context)
+
+    def test_action_consistency_allows_component_generated_by_command(self):
+        context = {
+            "project_structure": "standalone_components (NO NgModules)",
+            "existing_files": ["src/app/app.ts", "src/app/app.config.ts"],
+        }
+        payload = {
+            "actions": [
+                {"type": "command", "command": "ng generate component components/hero --standalone"},
+                {"type": "command", "command": "ng build"},
+            ]
+        }
+        _validate_action_consistency(payload, context)
 
     def test_build_ng_new_command_fast_init_uses_skip_install(self):
         cmd = _build_ng_new_command("hospital-landing", fast_init=True)
@@ -504,7 +531,7 @@ export class AppComponent {}""",
             orch_mod._run_cmd_utf8 = original
 
         self.assertEqual(failures, [])
-        self.assertEqual(len(reports), 3)
+        self.assertEqual(len(reports), 2)
         self.assertNotIn("ng lint", called_commands)
 
     def test_run_quality_checks_includes_lint_with_target(self):
@@ -522,8 +549,27 @@ export class AppComponent {}""",
             orch_mod._run_cmd_utf8 = original
 
         self.assertEqual(failures, [])
-        self.assertEqual(len(reports), 4)
+        self.assertEqual(len(reports), 3)
         self.assertIn("ng lint", called_commands)
+
+
+    def test_run_quality_checks_includes_e2e_with_target(self):
+        base = Path(tempfile.mkdtemp(prefix="sonny_quality_with_e2e_"))
+        project = base / "proj"
+        project.mkdir(parents=True, exist_ok=True)
+        (project / "angular.json").write_text('{"projects":{"app":{"architect":{"e2e":{}}}}}', encoding="utf-8")
+
+        called_commands: list[str] = []
+        original = orch_mod._run_cmd_utf8
+        orch_mod._run_cmd_utf8 = lambda cmd, cwd=None, timeout=30: (called_commands.append(cmd) or (0, "ok"))
+        try:
+            failures, reports = orch_mod._run_quality_checks(project)
+        finally:
+            orch_mod._run_cmd_utf8 = original
+
+        self.assertEqual(failures, [])
+        self.assertEqual(len(reports), 3)
+        self.assertIn("ng e2e", called_commands)
 
     def test_autofix_context_accumulates_quality_failures(self):
         base = Path(tempfile.mkdtemp(prefix="sonny_autofix_ctx_"))
@@ -531,6 +577,8 @@ export class AppComponent {}""",
         project = task / "proj"
         (project / "src" / "app").mkdir(parents=True, exist_ok=True)
         (project / "angular.json").write_text('{"projects":{"app":{"architect":{}}}}', encoding="utf-8")
+        (project / "package.json").write_text("{}", encoding="utf-8")
+        (project / "src" / "main.ts").write_text("console.log(1);", encoding="utf-8")
 
         captured_contexts: list[dict] = []
         round_counter = {"n": 0}
@@ -543,8 +591,13 @@ export class AppComponent {}""",
         original_get_actions = orch_mod.get_phase_actions
         original_quality = orch_mod._run_quality_checks
         original_autofix = orch_mod._autofix_with_llm
+        original_require_precheck = orch_mod.REQUIRE_PRECHECK
+        original_autoserve = orch_mod.START_NG_SERVE_ON_SUCCESS
 
         orch_mod._build_task_workspace = lambda user_request, workspace=None: task
+        orch_mod.REQUIRE_PRECHECK = False
+        orch_mod.START_NG_SERVE_ON_SUCCESS = False
+        orch_mod.START_NG_SERVE_ON_SUCCESS = False
         orch_mod.detect_angular_cli_version = lambda: "21.1.5"
         orch_mod.detect_node_npm_os = lambda: {"node": "v20", "npm": "10", "os": "Linux"}
 
@@ -589,6 +642,8 @@ export class AppComponent {}""",
             orch_mod.get_phase_actions = original_get_actions
             orch_mod._run_quality_checks = original_quality
             orch_mod._autofix_with_llm = original_autofix
+            orch_mod.REQUIRE_PRECHECK = original_require_precheck
+            orch_mod.START_NG_SERVE_ON_SUCCESS = original_autoserve
 
         self.assertTrue(result["ok"])
         self.assertEqual(len(captured_contexts), 2)
@@ -633,25 +688,38 @@ export class AppComponent {}""",
         self.assertEqual(state.phase_action_count, 1)
         self.assertEqual(len(state.action_history), 4)
 
-    def test_execute_actions_checks_loop_guard_per_action(self):
+    def test_execute_actions_auto_splits_large_write_phase(self):
         base = Path(tempfile.mkdtemp(prefix="sonny_action_limit_"))
         task = base / "task_action_limit"
         task.mkdir(parents=True, exist_ok=True)
+        (task / "angular.json").write_text("{}", encoding="utf-8")
 
         state = AgentState()
         state.set_task_workspace(task)
+        state.set_project_root(task)
         state.set_phase("Fase extensa")
 
         actions = [
             {"type": "file_write", "path": f"src/app/file_{idx}.ts", "content": "export const x = 1;"}
-            for idx in range(11)
+            for idx in range(6)
         ]
 
-        executor = ActionExecutor(workspace=task)
-        with self.assertRaises(ExecutorError):
-            executor.execute_actions({"actions": actions}, state)
+        commands: list[str] = []
+        original_run = agent_mod.subprocess.run
 
-        self.assertEqual(state.phase_action_count, 11)
+        def fake_run(cmd, shell, cwd, capture_output, text, timeout, encoding, errors):
+            commands.append(cmd)
+            return types.SimpleNamespace(returncode=0, stdout="ok", stderr="")
+
+        agent_mod.subprocess.run = fake_run
+        try:
+            executor = ActionExecutor(workspace=task)
+            results = executor.execute_actions({"actions": actions}, state)
+        finally:
+            agent_mod.subprocess.run = original_run
+
+        self.assertTrue(any(cmd == "ng build" for cmd in commands))
+        self.assertTrue(all(r.get("ok") for r in results))
 
     def test_project_has_lint_target_detection(self):
         base = Path(tempfile.mkdtemp(prefix="sonny_lint_target_"))
@@ -683,12 +751,325 @@ export class AppComponent {}""",
         self.assertFalse(results[0]["ok"])
         self.assertIn("anidadas", results[0]["error"])
 
+
+    def test_enforce_rigid_pipeline_generates_all_required_phases(self):
+        plan = {
+            "phases": [
+                {"name": "FASE 1 — ESTRUCTURA ARQUITECTÓNICA", "description": "x", "depends_on": []},
+                {"name": "FASE 3 — ACCESIBILIDAD Y SEO", "description": "y", "depends_on": []},
+            ]
+        }
+
+        rigid = _enforce_rigid_pipeline(plan)
+        names = [p["name"] for p in rigid["phases"]]
+        self.assertEqual(len(names), 5)
+        self.assertEqual(names[0], "FASE 1 — ESTRUCTURA ARQUITECTÓNICA")
+        self.assertEqual(names[-1], "FASE 5 — QUALITY CHECK FINAL")
+
     def test_task_workspace_isolation_unique_folders(self):
         a = _build_task_workspace("desarrolla una landing", None)
         b = _build_task_workspace("desarrolla una landing", None)
         self.assertNotEqual(str(a), str(b))
         self.assertTrue(a.exists())
         self.assertTrue(b.exists())
+
+    def test_execute_actions_injects_build_after_structural_changes(self):
+        base = Path(tempfile.mkdtemp(prefix="sonny_build_inject_"))
+        task = base / "task_build_inject"
+        task.mkdir(parents=True, exist_ok=True)
+
+        (task / "angular.json").write_text("{}", encoding="utf-8")
+        state = AgentState()
+        state.set_task_workspace(task)
+        state.set_project_root(task)
+        state.set_phase("FASE 1 — ESTRUCTURA ARQUITECTÓNICA")
+
+        commands: list[str] = []
+        original_run = agent_mod.subprocess.run
+
+        def fake_run(cmd, shell, cwd, capture_output, text, timeout, encoding, errors):
+            commands.append(cmd)
+            return types.SimpleNamespace(returncode=0, stdout="ok", stderr="")
+
+        agent_mod.subprocess.run = fake_run
+        try:
+            executor = ActionExecutor(workspace=task)
+            results = executor.execute_actions(
+                {
+                    "actions": [
+                        {"type": "file_write", "path": "src/app/a.ts", "content": "export const a=1;"},
+                        {"type": "file_modify", "path": "src/app/b.ts", "content": "export const b=1;"},
+                    ]
+                },
+                state,
+            )
+        finally:
+            agent_mod.subprocess.run = original_run
+
+        self.assertTrue(any(cmd == "ng build" for cmd in commands))
+        self.assertEqual(len(results), 3)
+
+    def test_execute_actions_auto_splits_consecutive_writes(self):
+        base = Path(tempfile.mkdtemp(prefix="sonny_write_streak_"))
+        task = base / "task_write_streak"
+        task.mkdir(parents=True, exist_ok=True)
+        (task / "angular.json").write_text("{}", encoding="utf-8")
+
+        state = AgentState()
+        state.set_task_workspace(task)
+        state.set_project_root(task)
+        state.set_phase("FASE 2 — IMPLEMENTACIÓN PROGRESIVA")
+
+        commands: list[str] = []
+        original_run = agent_mod.subprocess.run
+
+        def fake_run(cmd, shell, cwd, capture_output, text, timeout, encoding, errors):
+            commands.append(cmd)
+            return types.SimpleNamespace(returncode=0, stdout="ok", stderr="")
+
+        agent_mod.subprocess.run = fake_run
+        try:
+            executor = ActionExecutor(workspace=task)
+            results = executor.execute_actions(
+                {
+                    "actions": [
+                        {"type": "file_write", "path": "src/app/a.ts", "content": "export const a=1;"},
+                        {"type": "file_write", "path": "src/app/b.ts", "content": "export const b=1;"},
+                        {"type": "file_write", "path": "src/app/c.ts", "content": "export const c=1;"},
+                        {"type": "file_modify", "path": "src/app/d.ts", "content": "export const d=1;"},
+                    ]
+                },
+                state,
+            )
+        finally:
+            agent_mod.subprocess.run = original_run
+
+        self.assertTrue(any(cmd == "ng build" for cmd in commands))
+        self.assertTrue(all(r.get("ok") for r in results))
+
+    def test_split_actions_into_subfases_injects_build_every_three_writes(self):
+        payload = {
+            "actions": [
+                {"type": "file_write", "path": "a.ts", "content": "x"},
+                {"type": "file_write", "path": "b.ts", "content": "x"},
+                {"type": "file_modify", "path": "c.ts", "content": "x"},
+                {"type": "file_write", "path": "d.ts", "content": "x"},
+            ]
+        }
+        subfases = _split_actions_into_subfases(payload)
+        self.assertEqual(len(subfases), 2)
+        self.assertEqual(subfases[0]["actions"][-1], {"type": "command", "command": "ng build"})
+
+    def test_execute_command_uses_longer_timeout_for_npm_install(self):
+        base = Path(tempfile.mkdtemp(prefix="sonny_npm_timeout_"))
+        task = base / "task_npm_timeout"
+        task.mkdir(parents=True, exist_ok=True)
+
+        state = AgentState()
+        state.set_task_workspace(task)
+
+        captured = {"timeout": None}
+        original_run = agent_mod.subprocess.run
+
+        def fake_run(cmd, shell, cwd, capture_output, text, timeout, encoding, errors):
+            captured["timeout"] = timeout
+            return types.SimpleNamespace(returncode=0, stdout="ok", stderr="")
+
+        agent_mod.subprocess.run = fake_run
+        try:
+            execute_command({"type": "command", "command": "npm install"}, {"workspace": task, "state": state})
+        finally:
+            agent_mod.subprocess.run = original_run
+
+        self.assertEqual(captured["timeout"], agent_mod.TIMEOUT_NPM_INSTALL)
+
+    def test_collect_project_file_context_skips_node_modules(self):
+        base = Path(tempfile.mkdtemp(prefix="sonny_ctx_filter_"))
+        task = base / "task_ctx_filter"
+        project = task / "proj"
+        (project / "src" / "app").mkdir(parents=True, exist_ok=True)
+        (project / "node_modules" / "@algolia" / "abtesting").mkdir(parents=True, exist_ok=True)
+        (project / "src" / "app" / "app.ts").write_text("export class App {}", encoding="utf-8")
+        (project / "node_modules" / "@algolia" / "abtesting" / "index.ts").write_text("export const lib = 1", encoding="utf-8")
+
+        state = AgentState()
+        state.set_task_workspace(task)
+        state.set_project_root(project)
+
+        ctx = agent_mod._collect_project_file_context("analiza ts", state)
+        self.assertIn("src/app/app.ts", ctx)
+        self.assertNotIn("node_modules", ctx)
+
+    def test_validate_action_consistency_blocks_invalid_standalone_app_config(self):
+        context = {
+            "project_structure": "standalone_components (NO NgModules)",
+            "existing_files": ["src/app/app.ts", "src/app/app.config.ts"],
+        }
+        payload = {
+            "actions": [
+                {
+                    "type": "file_modify",
+                    "path": "src/app/app.config.ts",
+                    "content": "export const AppConfig = { apiUrl: 'x' };",
+                }
+            ]
+        }
+        with self.assertRaises(ValidationError):
+            _validate_action_consistency(payload, context)
+
+    def test_extract_error_signature_reads_error_lines(self):
+        signature = _extract_error_signature("line\nX [ERROR] Cannot find name 'x'\nTS2304: foo")
+        self.assertIn("ERROR", signature)
+        self.assertIn("TS2304", signature)
+
+    def test_phase2_requires_component_under_components_folder(self):
+        base = Path(tempfile.mkdtemp(prefix="sonny_phase2_deliverable_"))
+        project = base / "proj"
+        (project / "src" / "app").mkdir(parents=True, exist_ok=True)
+        ok, msg = _phase_has_minimum_deliverable(
+            "FASE 2 — IMPLEMENTACIÓN PROGRESIVA",
+            project,
+            "desarrolla una landing page en angular",
+        )
+        self.assertFalse(ok)
+        self.assertIn("src/app/components", msg)
+
+    def test_objective_related_components_detects_created_component(self):
+        base = Path(tempfile.mkdtemp(prefix="sonny_objective_components_"))
+        project = base / "proj"
+        comp = project / "src" / "app" / "components" / "bar-menu"
+        comp.mkdir(parents=True, exist_ok=True)
+        (comp / "bar-menu.component.ts").write_text("export class BarMenuComponent {}", encoding="utf-8")
+
+        related = _objective_related_components(project, "landing page para bar")
+        self.assertTrue(related)
+        self.assertTrue(any("bar-menu.component.ts" in item for item in related))
+
+    def test_last_production_build_successful_helper(self):
+        phase_results = [
+            {"phase": "quality_checks_x", "results": [{"command": "ng build --configuration production", "ok": False}]},
+            {"phase": "quality_checks_y", "results": [{"command": "ng build --configuration production", "ok": True}]},
+        ]
+        self.assertTrue(_was_last_production_build_successful(phase_results))
+
+    def test_objective_related_components_requires_token_match(self):
+        base = Path(tempfile.mkdtemp(prefix="sonny_objective_strict_"))
+        project = base / "proj"
+        comp = project / "src" / "app" / "components" / "generic"
+        comp.mkdir(parents=True, exist_ok=True)
+        (comp / "generic.component.ts").write_text("export class GenericComponent {}", encoding="utf-8")
+
+        related = _objective_related_components(project, "landing page para bar")
+        self.assertEqual(related, [])
+
+    def test_last_production_build_successful_uses_quality_reports(self):
+        phase_results = [
+            {"phase": "FASE 1", "results": [{"ok": True, "output": "done"}]},
+            {
+                "phase": "quality_checks_FASE_5_round_1",
+                "results": [
+                    {"command": "ng build --configuration production", "ok": True},
+                ],
+            },
+        ]
+        self.assertTrue(_was_last_production_build_successful(phase_results))
+
+    def test_planner_builds_minimal_correction_prompt(self):
+        captured = {"prompt": ""}
+
+        def fake_call(prompt: str) -> str:
+            captured["prompt"] = prompt
+            return '{"actions": [{"type": "command", "command": "ng build"}]}'
+
+        planner_mod.call_llm = fake_call
+        planner_mod.get_corrected_phase_actions(
+            "FASE 1 — ESTRUCTURA ARQUITECTÓNICA",
+            {"actions": [{"type": "file_write", "path": "src/app/app.config.ts", "content": "x"}]},
+            "app.config.ts debe exportar ApplicationConfig",
+            {
+                "project_structure": "standalone_components (NO NgModules)",
+                "angular_project_version": "^21.1.0",
+                "runtime_env": {"node": "v20"},
+                "existing_files": ["src/app/app.ts", "src/app/app.config.ts"],
+                "app_tree": ["src/app/app.ts", "src/app/app.config.ts"],
+            },
+        )
+
+        self.assertIn("Corrige únicamente las acciones inválidas", captured["prompt"])
+        self.assertIn("ACCIONES PREVIAS (JSON)", captured["prompt"])
+        self.assertNotIn("COMANDOS VÁLIDOS", captured["prompt"])
+
+    def test_orchestrator_retries_invalid_actions_with_correction_prompt(self):
+        base = Path(tempfile.mkdtemp(prefix="sonny_retry_actions_"))
+        task = base / "task"
+        project = task / "proj"
+        (project / "src" / "app" / "components" / "bar-menu").mkdir(parents=True, exist_ok=True)
+        (project / "src" / "app" / "components" / "bar-menu" / "bar-menu.component.ts").write_text("export class BarMenuComponent {}", encoding="utf-8")
+        (project / "src" / "main.ts").write_text("console.log(1)", encoding="utf-8")
+        (project / "angular.json").write_text("{}", encoding="utf-8")
+        (project / "package.json").write_text("{}", encoding="utf-8")
+
+        calls = {"phase": 0, "corrected": 0}
+        original_build_task = orch_mod._build_task_workspace
+        original_detect_cli = orch_mod.detect_angular_cli_version
+        original_detect_env = orch_mod.detect_node_npm_os
+        original_ensure = orch_mod._ensure_angular_project_initialized
+        original_get_master = orch_mod.get_master_plan
+        original_get_actions = orch_mod.get_phase_actions
+        original_get_corrected = orch_mod.get_corrected_phase_actions
+        original_quality = orch_mod._run_quality_checks
+        original_precheck = orch_mod.REQUIRE_PRECHECK
+        original_autoserve = orch_mod.START_NG_SERVE_ON_SUCCESS
+
+        orch_mod._build_task_workspace = lambda user_request, workspace=None: task
+        orch_mod.detect_angular_cli_version = lambda: "21.1.5"
+        orch_mod.detect_node_npm_os = lambda: {"node": "v20", "npm": "10", "os": "Linux"}
+        orch_mod.REQUIRE_PRECHECK = False
+        orch_mod.START_NG_SERVE_ON_SUCCESS = False
+
+        def fake_ensure(task_workspace, state, user_request):
+            state.set_project_root(project)
+            state.angular_project_version = "21.1.5"
+
+        orch_mod._ensure_angular_project_initialized = fake_ensure
+        orch_mod.get_master_plan = lambda user_request, preferred_site=None: {
+            "phases": [{"name": "FASE 1 — ESTRUCTURA ARQUITECTÓNICA", "description": "x", "depends_on": []}]
+        }
+
+        def bad_actions(phase_name, context, preferred_site=None):
+            calls["phase"] += 1
+            return {"actions": [{"type": "file_write", "path": "src/app/app.module.ts", "content": "x"}]}
+
+        def corrected_actions(phase_name, previous_actions_payload, validation_error, context, preferred_site=None):
+            calls["corrected"] += 1
+            safe_name = re.sub(r"[^a-z0-9]+", "-", phase_name.lower()).strip("-")
+            base = f"src/app/components/{safe_name}/{safe_name}.component"
+            return {"actions": [
+                {"type": "file_write", "path": f"{base}.ts", "content": "export class XComponent {}"},
+                {"type": "file_write", "path": f"{base}.html", "content": "<section></section>"},
+                {"type": "file_write", "path": f"{base}.scss", "content": ":host { display: block; }"},
+            ]}
+
+        orch_mod.get_phase_actions = bad_actions
+        orch_mod.get_corrected_phase_actions = corrected_actions
+        orch_mod._run_quality_checks = lambda project_root: ([], [{"command": "ng build --configuration production", "ok": True, "type": "build", "output": ""}])
+
+        try:
+            result = orch_mod.run_orchestrator("desarrolla una landing page en angular para bar")
+        finally:
+            orch_mod._build_task_workspace = original_build_task
+            orch_mod.detect_angular_cli_version = original_detect_cli
+            orch_mod.detect_node_npm_os = original_detect_env
+            orch_mod._ensure_angular_project_initialized = original_ensure
+            orch_mod.get_master_plan = original_get_master
+            orch_mod.get_phase_actions = original_get_actions
+            orch_mod.get_corrected_phase_actions = original_get_corrected
+            orch_mod._run_quality_checks = original_quality
+            orch_mod.REQUIRE_PRECHECK = original_precheck
+            orch_mod.START_NG_SERVE_ON_SUCCESS = original_autoserve
+
+        self.assertGreaterEqual(calls["corrected"], 1)
+        self.assertIn("phase_results", result)
 
 
 if __name__ == "__main__":

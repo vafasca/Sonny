@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from core.pipeline_config import MAX_ACTIONS_PER_PHASE
 from core.state_manager import AgentState
 
 
@@ -11,7 +12,7 @@ class LoopGuardError(RuntimeError):
 
 class LoopGuard:
     MAX_GLOBAL_ITERATIONS = 25
-    MAX_ACTIONS_PER_PHASE = 10
+    MAX_ACTIONS_PER_PHASE = MAX_ACTIONS_PER_PHASE
     MAX_SAME_ACTION_STREAK = 5
     MAX_PHASE_REPETITIONS = 3
 
@@ -22,7 +23,7 @@ class LoopGuard:
 
         if state.phase_action_count > cls.MAX_ACTIONS_PER_PHASE:
             raise LoopGuardError(
-                f"Loop detectado: la fase '{state.current_phase}' superó 10 acciones."
+                f"Loop detectado: la fase '{state.current_phase}' superó {cls.MAX_ACTIONS_PER_PHASE} acciones."
             )
 
         if state.current_phase and state.phase_repetition_count[state.current_phase] > cls.MAX_PHASE_REPETITIONS:
