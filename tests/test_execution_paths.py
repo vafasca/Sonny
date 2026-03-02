@@ -897,8 +897,30 @@ export class AppComponent {}""",
 
     def test_last_production_build_successful_helper(self):
         phase_results = [
-            {"phase": "x", "results": [{"command": "ng build --configuration production", "ok": False}]},
-            {"phase": "y", "results": [{"command": "ng build --configuration production", "ok": True}]},
+            {"phase": "quality_checks_x", "results": [{"command": "ng build --configuration production", "ok": False}]},
+            {"phase": "quality_checks_y", "results": [{"command": "ng build --configuration production", "ok": True}]},
+        ]
+        self.assertTrue(_was_last_production_build_successful(phase_results))
+
+    def test_objective_related_components_requires_token_match(self):
+        base = Path(tempfile.mkdtemp(prefix="sonny_objective_strict_"))
+        project = base / "proj"
+        comp = project / "src" / "app" / "components" / "generic"
+        comp.mkdir(parents=True, exist_ok=True)
+        (comp / "generic.component.ts").write_text("export class GenericComponent {}", encoding="utf-8")
+
+        related = _objective_related_components(project, "landing page para bar")
+        self.assertEqual(related, [])
+
+    def test_last_production_build_successful_uses_quality_reports(self):
+        phase_results = [
+            {"phase": "FASE 1", "results": [{"ok": True, "output": "done"}]},
+            {
+                "phase": "quality_checks_FASE_5_round_1",
+                "results": [
+                    {"command": "ng build --configuration production", "ok": True},
+                ],
+            },
         ]
         self.assertTrue(_was_last_production_build_successful(phase_results))
 

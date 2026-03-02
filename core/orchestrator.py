@@ -18,6 +18,8 @@ from core.pipeline_config import (
     MAX_ACTIONS_PER_PHASE,
     MAX_LLM_CALLS_PER_PHASE,
     REQUIRE_PRECHECK,
+    MAX_PHASE2_SUBPHASES,
+    LANDING_PHASE2_MIN_COMPONENTS,
 )
 from core.ai_scraper import available_sites, set_preferred_site
 from core.state_manager import AgentState
@@ -644,6 +646,13 @@ def _validate_action_consistency(actions_payload: dict, context: dict) -> None:
 
 
 
+def _target_min_components_for_request(user_request: str) -> int:
+    low = (user_request or "").lower()
+    if "landing" in low:
+        return LANDING_PHASE2_MIN_COMPONENTS
+    return 1
+
+
 def _phase_has_minimum_deliverable(phase_name: str, project_root: Path | None, user_request: str) -> tuple[bool, str]:
     if not project_root or not _is_angular_request(user_request):
         return True, ""
@@ -652,16 +661,17 @@ def _phase_has_minimum_deliverable(phase_name: str, project_root: Path | None, u
     if "fase 2" not in low:
         return True, ""
 
+    required = _target_min_components_for_request(user_request)
     components_dir = Path(project_root) / "src" / "app" / "components"
     if not components_dir.exists():
-        return False, "Fase 2 incompleta: no existe src/app/components/ con componentes nuevos."
+        return False, f"Fase 2 incompleta: no existe src/app/components/ (mínimo requerido: {required} componentes)."
 
     component_files = [
         p for p in components_dir.rglob("*.component.ts")
         if p.is_file()
     ]
-    if not component_files:
-        return False, "Fase 2 incompleta: no se detectó ningún *.component.ts en src/app/components/."
+    if len(component_files) < required:
+        return False, f"Fase 2 incompleta: se detectaron {len(component_files)} componentes y se requieren al menos {required}."
 
     return True, ""
 
@@ -674,24 +684,29 @@ def _objective_related_components(project_root: Path | None, user_request: str) 
     if not components_root.exists():
         return []
 
-    tokens = [t for t in re.findall(r"[a-záéíóúñ]{3,}", (user_request or "").lower()) if t not in {"para", "con", "una", "landing", "page", "angular"}]
+    tokens = [
+        t for t in re.findall(r"[a-záéíóúñ]{3,}", (user_request or "").lower())
+        if t not in {"para", "con", "una", "landing", "page", "angular", "desarrolla", "crear", "genera"}
+    ]
     files = [str(p.relative_to(project_root)).replace("\\", "/") for p in components_root.rglob("*.component.ts") if p.is_file()]
-    if not files:
+    if not files or not tokens:
         return []
-    if not tokens:
-        return files
 
     matched = [f for f in files if any(tok in f.lower() for tok in tokens)]
-    return matched or files
+    return matched
 
 
 def _was_last_production_build_successful(phase_results: list[dict]) -> bool:
     for phase in reversed(phase_results):
+        phase_name = str(phase.get("phase", "")).lower()
+        if "quality_checks" not in phase_name and "fase 5" not in phase_name:
+            continue
         for item in reversed(list(phase.get("results", []) or [])):
-            cmd = str(item.get("command", ""))
-            if cmd.strip() == "ng build --configuration production":
+            cmd = str(item.get("command", "")).strip()
+            if cmd == "ng build --configuration production":
                 return bool(item.get("ok"))
     return False
+
 
 def run_orchestrator(
     user_request: str,
@@ -732,6 +747,7 @@ def run_orchestrator(
     ordered_phases = _sort_phases(master_plan)
     print(f"  {C.CYAN}Plan validado: {len(ordered_phases)} fase(s){C.RESET}")
 
+    phase_retry_count: dict[str, int] = {}
     for phase in ordered_phases:
         phase_name = phase["name"]
         state.set_phase(phase_name)
@@ -793,8 +809,17 @@ def run_orchestrator(
             if deliverable_ok:
                 state.complete_phase(phase_name)
             else:
-                orchestration_warnings.append(deliverable_warning)
-                log_validation_failed(f"deliverable:{phase_name}", deliverable_warning)
+                is_phase2 = "fase 2" in phase_name.lower()
+                retry_key = "FASE 2 — IMPLEMENTACIÓN PROGRESIVA" if is_phase2 else phase_name
+                retries = phase_retry_count.get(retry_key, 0)
+                if is_phase2 and retries < (MAX_PHASE2_SUBPHASES - 1):
+                    phase_retry_count[retry_key] = retries + 1
+                    sub_name = f"FASE 2 — IMPLEMENTACIÓN PROGRESIVA (subfase {retries + 2})"
+                    ordered_phases.append({"name": sub_name, "description": phase.get("description", ""), "depends_on": [phase_name]})
+                    log_phase_event(phase_name, "retry_scheduled", deliverable_warning)
+                else:
+                    orchestration_warnings.append(deliverable_warning)
+                    log_validation_failed(f"deliverable:{phase_name}", deliverable_warning)
             state.reset_phase()
             phase_results.append(
                 {
@@ -912,7 +937,7 @@ def run_orchestrator(
     last_prod_build_ok = _was_last_production_build_successful(phase_results)
     objective_verified = True
     if _is_angular_request(user_request):
-        objective_verified = bool(objective_components)
+        objective_verified = bool(objective_components) or _phase_has_minimum_deliverable("FASE 2 — IMPLEMENTACIÓN PROGRESIVA", Path(state.project_root) if state.project_root else None, user_request)[0]
         if not objective_verified:
             orchestration_warnings.append("No se generaron componentes en src/app/components/ relacionados al objetivo.")
         if not last_prod_build_ok:
