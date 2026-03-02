@@ -234,6 +234,39 @@ def _phase_constraints_text(phase_name: str, context: dict) -> str:
     return generic
 
 
+def _render_project_tree(app_tree: list[str]) -> str:
+    if not app_tree:
+        return "src/\n └── app/\n     └── (sin archivos detectados)"
+
+    lines = ["src/", " └── app/"]
+    app_only = []
+    for item in app_tree:
+        norm = str(item).replace('\\', '/').strip('/')
+        if not norm.startswith('src/app/'):
+            continue
+        app_only.append(norm.replace('src/app/', ''))
+
+    app_only = sorted(dict.fromkeys(app_only))
+    if not app_only:
+        return "src/\n └── app/\n     └── (sin archivos detectados)"
+
+    for idx, rel in enumerate(app_only):
+        branch = " └──" if idx == len(app_only) - 1 else " ├──"
+        lines.append(f"     {branch} {rel}")
+    return "\n".join(lines)
+
+
+def _extra_forbidden_for_standalone(structure: str) -> list[str]:
+    if "standalone" not in (structure or "").lower():
+        return []
+    return [
+        "app.module.ts",
+        "NgModules",
+        "Archivos de bootstrap",
+        "loadChildren",
+    ]
+
+
 def get_phase_actions(phase_name: str, context: dict, preferred_site: str | None = None) -> dict:
     existing = _dedupe_keep_order(list(context.get("existing_files", []) or []), 40)
     missing = _dedupe_keep_order(list(context.get("missing_files", []) or []), 40)
@@ -242,58 +275,14 @@ def get_phase_actions(phase_name: str, context: dict, preferred_site: str | None
     deprecated = _dedupe_keep_order(list(context.get("deprecated_commands", []) or []), 20)
     angular_rules = _dedupe_keep_order(list(context.get("angular_rules", []) or []), 30)
     runtime = context.get("runtime_env", {})
+    structure = context.get("project_structure", "unknown")
 
-    divider = "─" * 70
-    project_block = (
-        f"\n{divider}\n"
-        "CONTEXTO DEL PROYECTO ANGULAR:\n"
-        f"{divider}\n"
-        f"Angular CLI global: {context.get('angular_cli_version', 'unknown')}\n"
-        f"Angular del proyecto: {context.get('angular_project_version', 'unknown')}\n"
-        f"Node: {runtime.get('node', 'unknown')} / npm: {runtime.get('npm', 'unknown')} / SO: {runtime.get('os', 'unknown')}\n"
-        f"Estructura: {context.get('project_structure', 'unknown')}\n"
-        f"Task workspace: {context.get('task_workspace', '')}\n"
-        f"Project root: {context.get('project_root', '')}\n"
-        f"Current workdir: {context.get('current_workdir', '')}\n"
-        "\nARCHIVOS QUE EXISTEN (puedes modificar):\n"
-        + "\n".join(f"• {f}" for f in existing)
-        + "\n\nARCHIVOS QUE NO EXISTEN (NO intentes modificar, usa file_write):\n"
-        + "\n".join(f"• {f}" for f in missing)
-        + "\n\nÁRBOL REAL src/app (escaneado):\n"
-        + ("\n".join(f"• {f}" for f in app_tree) if app_tree else "• (vacío/no detectado)")
-        + "\n\nCOMANDOS VÁLIDOS:\n"
-        + "\n".join(f"• {c}" for c in valid_commands)
-        + "\n\nCOMANDOS DEPRECADOS/NO USAR:\n"
-        + "\n".join(f"• {c}" for c in deprecated)
-        + "\n\nREGLAS ANGULAR:\n"
-        + "\n".join(f"• {r}" for r in angular_rules)
-        + f"\n{divider}\n"
-    )
-
-    exec_rules = (
-        "Reglas de ejecución:\n"
-        "- Usa rutas RELATIVAS lógicas al proyecto (ej: src/app/app.ts).\n"
-        "- NO uses rutas absolutas.\n"
-        "- El executor resolverá rutas absolutas de forma segura.\n"
-        "- Si archivo no existe, usa file_write en vez de file_modify.\n"
-        "- No uses ng serve/npm start en modo automático.\n"
-        "\nREGLAS CRÍTICAS PARA EL CAMPO \"content\":\n"
-        "- SIEMPRE debe contener código fuente COMPLETO listo para escribirse en disco.\n"
-        "- Si es .scss → selectores CSS reales. Ejemplo: body { margin: 0; }\n"
-        "- Si es .ts   → código TypeScript Angular compilable.\n"
-        "- Si es .html → markup HTML/Angular válido.\n"
-        "- Si es .md   → texto y markdown libremente.\n"
-        "\nPROHIBIDO en \"content\" para .scss, .ts y .html:\n"
-        "- Texto descriptivo (\"Agregar X, hacer Y...\").\n"
-        "- Instrucciones en lenguaje natural.\n"
-        "- Comentarios sin código real.\n"
-        "\n❌ MAL: \"content\": \"Agregar focus-visible a botones...\"\n"
-        "✅ BIEN: \"content\": \":focus-visible { outline: 3px solid #667EEA; }\"\n"
-    )
+    no_create = _dedupe_keep_order(_extra_forbidden_for_standalone(structure), 10)
+    tree_view = _render_project_tree(app_tree)
 
     prompt = (
-        f"Genera acciones para la fase '{phase_name}'.\n"
-        "Formato obligatorio:\n"
+        f"Genera acciones para la fase en base a mi estructura actual '{phase_name}'.\n"
+        "Responde SOLO con JSON válido con este formato:\n"
         "{\n"
         '  "actions": [\n'
         '    {"type": "command", "command": "..."},\n'
@@ -301,11 +290,55 @@ def get_phase_actions(phase_name: str, context: dict, preferred_site: str | None
         '    {"type": "file_modify", "path": "...", "content": "..."},\n'
         '    {"type": "llm_call", "prompt": "..."}\n'
         "  ]\n"
-        "}\n"
-        f"{project_block}\n"
-        f"{_phase_constraints_text(phase_name, context)}\n"
-        f"{exec_rules}"
+        "}\n\n"
+        "────────────────────────────────────\n"
+        "CONTEXTO DETECTADO AUTOMÁTICAMENTE\n"
+        "────────────────────────────────────\n"
+        f"Angular CLI: {context.get('angular_cli_version', 'unknown')}\n"
+        f"Angular: {context.get('angular_project_version', 'unknown')}\n"
+        f"Node: {runtime.get('node', 'unknown')}\n"
+        f"Arquitectura: {structure}\n"
+        "\nEstructura actual:\n\n"
+        f"{tree_view}\n\n"
+        "Archivos existentes (puedes modificar):\n"
+        + "\n".join(f"- {f}" for f in existing)
+        + "\n\nArchivos faltantes (si los necesitas, usa file_write):\n"
+        + "\n".join(f"- {f}" for f in missing)
+        + "\n\n"
     )
+
+    if no_create:
+        prompt += "NO crear:\n" + "\n".join(f"- {item}" for item in no_create) + "\n\n"
+
+    prompt += (
+        "────────────────────────────────────\n"
+        f"REGLAS {phase_name}\n"
+        "────────────────────────────────────\n"
+        f"{_phase_constraints_text(phase_name, context)}\n"
+        "────────────────────────────────────\n"
+        "LÍMITES DEL PIPELINE\n"
+        "────────────────────────────────────\n"
+        f"- Máx {MAX_ACTIONS_PER_PHASE} acciones.\n"
+        f"- Máx {MAX_FILE_WRITES_WITHOUT_BUILD} escrituras consecutivas sin ng build.\n"
+        f"- Máx {MAX_LLM_CALLS_PER_PHASE} llm_call.\n"
+        "- Usar rutas relativas.\n"
+        "- Incluir ng build al cerrar cambios estructurales.\n\n"
+        "────────────────────────────────────\n"
+        "REGLAS DEL CAMPO \"content\"\n"
+        "────────────────────────────────────\n"
+        "- Debe contener código fuente completo y compilable.\n"
+        "- No incluir texto descriptivo.\n"
+        "- Si archivo no existe, usa file_write en vez de file_modify.\n"
+        "- No uses ng serve/npm start en modo automático.\n"
+    )
+
+    if valid_commands:
+        prompt += "\nComandos válidos:\n" + "\n".join(f"- {c}" for c in valid_commands)
+    if deprecated:
+        prompt += "\n\nComandos no usar:\n" + "\n".join(f"- {c}" for c in deprecated)
+    if angular_rules:
+        prompt += "\n\nReglas angular adicionales:\n" + "\n".join(f"- {r}" for r in angular_rules)
+
 
     forbidden = _dedupe_keep_order(list(context.get("forbidden_commands", []) or []), 30)
     if forbidden:
