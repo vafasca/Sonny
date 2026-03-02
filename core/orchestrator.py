@@ -610,6 +610,29 @@ def _build_angular_rules(project_structure: str, project_version: str) -> list[s
     ]
     return rules
 
+def _has_angular_generate_for_component(actions: list[dict], component_name: str) -> bool:
+    target = (component_name or "").strip().lower()
+    for action in actions:
+        if action.get("type") != "command":
+            continue
+        cmd = str(action.get("command", "")).strip().lower()
+        if not ("ng generate component" in cmd or "ng g component" in cmd):
+            continue
+        if not target:
+            return True
+        if target in cmd:
+            return True
+    return False
+
+
+def _has_component_companion_files(actions: list[dict], base_no_ext: str) -> bool:
+    expected_html = f"{base_no_ext}.html"
+    expected_style_a = f"{base_no_ext}.scss"
+    expected_style_b = f"{base_no_ext}.css"
+    paths = {str(a.get("path", "")).replace("\\", "/") for a in actions if a.get("type") in {"file_write", "file_modify"}}
+    return expected_html in paths and (expected_style_a in paths or expected_style_b in paths)
+
+
 def _validate_action_consistency(actions_payload: dict, context: dict) -> None:
     structure = context.get("project_structure", "unknown")
     existing = set(context.get("existing_files", []) or [])
@@ -622,6 +645,16 @@ def _validate_action_consistency(actions_payload: dict, context: dict) -> None:
             raise ValidationError(
                 "Acción inválida para standalone: no crees app.module.ts si no existe en el árbol real."
             )
+
+        if "/components/" in path and path.endswith(".component.ts"):
+            base_no_ext = path[:-3]
+            comp_name = Path(path).stem.replace(".component", "")
+            has_generate = _has_angular_generate_for_component(actions_payload.get("actions", []), comp_name)
+            has_companion = _has_component_companion_files(actions_payload.get("actions", []), base_no_ext)
+            if not has_generate and not has_companion:
+                raise ValidationError(
+                    "Acción inválida: para crear componentes en src/app/components usa ng generate component o incluye .ts + .html + .scss/.css en acciones consistentes."
+                )
 
         if structure == "standalone_components (NO NgModules)" and path.endswith("src/app/app.ts"):
             content = str(action.get("content", ""))

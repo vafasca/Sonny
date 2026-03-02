@@ -193,7 +193,7 @@ Package Manager   : npm 11.10.1
         self.assertIn("Archivos existentes", captured["prompt"])
         self.assertIn("Comandos válidos", captured["prompt"])
         self.assertNotIn("Contexto JSON:", captured["prompt"])
-        self.assertIn('REGLAS DEL CAMPO "content"', captured["prompt"])
+        self.assertIn("REGLAS DE GENERACIÓN DE ARTEFACTOS ANGULAR", captured["prompt"])
         self.assertIn('REGLAS DEL CAMPO "content"', captured["prompt"])
         self.assertEqual(payload["actions"][0]["type"], "llm_call")
 
@@ -316,6 +316,33 @@ Package Manager   : npm 11.10.1
         }
         with self.assertRaises(ValidationError):
             _validate_action_consistency(payload, context)
+
+
+    def test_action_consistency_blocks_component_ts_without_generate_or_companions(self):
+        context = {
+            "project_structure": "standalone_components (NO NgModules)",
+            "existing_files": ["src/app/app.ts", "src/app/app.config.ts"],
+        }
+        payload = {
+            "actions": [
+                {"type": "file_write", "path": "src/app/components/hero/hero.component.ts", "content": "export class HeroComponent {}"}
+            ]
+        }
+        with self.assertRaises(ValidationError):
+            _validate_action_consistency(payload, context)
+
+    def test_action_consistency_allows_component_generated_by_command(self):
+        context = {
+            "project_structure": "standalone_components (NO NgModules)",
+            "existing_files": ["src/app/app.ts", "src/app/app.config.ts"],
+        }
+        payload = {
+            "actions": [
+                {"type": "command", "command": "ng generate component components/hero --standalone"},
+                {"type": "command", "command": "ng build"},
+            ]
+        }
+        _validate_action_consistency(payload, context)
 
     def test_build_ng_new_command_fast_init_uses_skip_install(self):
         cmd = _build_ng_new_command("hospital-landing", fast_init=True)
@@ -991,7 +1018,12 @@ export class AppComponent {}""",
         def corrected_actions(phase_name, previous_actions_payload, validation_error, context, preferred_site=None):
             calls["corrected"] += 1
             safe_name = re.sub(r"[^a-z0-9]+", "-", phase_name.lower()).strip("-")
-            return {"actions": [{"type": "file_write", "path": f"src/app/components/{safe_name}/{safe_name}.component.ts", "content": "export class XComponent {}"}]}
+            base = f"src/app/components/{safe_name}/{safe_name}.component"
+            return {"actions": [
+                {"type": "file_write", "path": f"{base}.ts", "content": "export class XComponent {}"},
+                {"type": "file_write", "path": f"{base}.html", "content": "<section></section>"},
+                {"type": "file_write", "path": f"{base}.scss", "content": ":host { display: block; }"},
+            ]}
 
         orch_mod.get_phase_actions = bad_actions
         orch_mod.get_corrected_phase_actions = corrected_actions
