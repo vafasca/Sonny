@@ -14,7 +14,7 @@ ai_scraper_stub.available_sites = lambda: ["chatgpt", "claude", "gemini", "qwen"
 sys.modules["core.ai_scraper"] = ai_scraper_stub
 
 from core.agent import ExecutorError, execute_command, modify_file, write_file, _block_interactive_commands, ActionExecutor, _split_actions_into_subfases
-from core.orchestrator import _build_task_workspace, _parse_angular_cli_version, _snapshot_project_files, _strip_ansi, _build_angular_rules, _validate_action_consistency, _sanitize_project_name, _build_ng_new_command, _project_has_lint_target, _enforce_rigid_pipeline, _extract_error_signature, _phase_has_minimum_deliverable, _objective_related_components, _was_last_production_build_successful
+from core.orchestrator import _build_task_workspace, _parse_angular_cli_version, _snapshot_project_files, _strip_ansi, _build_angular_rules, _validate_action_consistency, _sanitize_project_name, _build_ng_new_command, _project_has_lint_target, _extract_error_signature, _phase_has_minimum_deliverable, _objective_related_components, _was_last_production_build_successful
 from core.state_manager import AgentState
 from core import planner as planner_mod
 import core.agent as agent_mod
@@ -752,19 +752,51 @@ export class AppComponent {}""",
         self.assertIn("anidadas", results[0]["error"])
 
 
-    def test_enforce_rigid_pipeline_generates_all_required_phases(self):
-        plan = {
+    def test_run_orchestrator_preserves_ai_defined_plan(self):
+        captured = {"plan": None}
+
+        original_get_master_plan = orch_mod.get_master_plan
+        original_get_phase_actions = orch_mod.get_phase_actions
+        original_validate_plan = orch_mod.validate_plan
+        original_validate_actions = orch_mod.validate_actions
+        original_run_precheck = orch_mod._run_precheck_phase
+        original_quality = orch_mod._run_quality_checks
+        original_ensure_init = orch_mod._ensure_angular_project_initialized
+        original_check_deliverable = orch_mod._phase_has_minimum_deliverable
+        original_exec_actions = agent_mod.ActionExecutor.execute_actions
+
+        orch_mod.get_master_plan = lambda req, preferred_site=None: {
             "phases": [
-                {"name": "FASE 1 — ESTRUCTURA ARQUITECTÓNICA", "description": "x", "depends_on": []},
-                {"name": "FASE 3 — ACCESIBILIDAD Y SEO", "description": "y", "depends_on": []},
+                {"name": "Planificación", "description": "x", "depends_on": []},
+                {"name": "Implementación", "description": "y", "depends_on": ["Planificación"]},
+                {"name": "Pruebas", "description": "z", "depends_on": ["Implementación"]},
             ]
         }
+        orch_mod.get_phase_actions = lambda *args, **kwargs: {"actions": []}
+        orch_mod.validate_plan = lambda payload: None
+        orch_mod.validate_actions = lambda payload: None
+        orch_mod._run_precheck_phase = lambda *args, **kwargs: None
+        orch_mod._run_quality_checks = lambda *args, **kwargs: ([], [])
+        orch_mod._ensure_angular_project_initialized = lambda *args, **kwargs: None
+        orch_mod._phase_has_minimum_deliverable = lambda *args, **kwargs: (True, "")
+        agent_mod.ActionExecutor.execute_actions = lambda self, payload, state: []
 
-        rigid = _enforce_rigid_pipeline(plan)
-        names = [p["name"] for p in rigid["phases"]]
-        self.assertEqual(len(names), 5)
-        self.assertEqual(names[0], "FASE 1 — ESTRUCTURA ARQUITECTÓNICA")
-        self.assertEqual(names[-1], "FASE 5 — QUALITY CHECK FINAL")
+        try:
+            result = orch_mod.run_orchestrator("tarea simple", workspace=Path(tempfile.mkdtemp(prefix="sonny_plan_dynamic_")))
+            captured["plan"] = result.get("plan")
+        finally:
+            orch_mod.get_master_plan = original_get_master_plan
+            orch_mod.get_phase_actions = original_get_phase_actions
+            orch_mod.validate_plan = original_validate_plan
+            orch_mod.validate_actions = original_validate_actions
+            orch_mod._run_precheck_phase = original_run_precheck
+            orch_mod._run_quality_checks = original_quality
+            orch_mod._ensure_angular_project_initialized = original_ensure_init
+            orch_mod._phase_has_minimum_deliverable = original_check_deliverable
+            agent_mod.ActionExecutor.execute_actions = original_exec_actions
+
+        names = [p["name"] for p in captured["plan"]["phases"]]
+        self.assertEqual(names, ["Planificación", "Implementación", "Pruebas"])
 
     def test_task_workspace_isolation_unique_folders(self):
         a = _build_task_workspace("desarrolla una landing", None)

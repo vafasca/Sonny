@@ -100,49 +100,6 @@ def detect_node_npm_os() -> dict[str, str]:
 
 
 
-RIGID_PHASES = [
-    "FASE 1 — ESTRUCTURA ARQUITECTÓNICA",
-    "FASE 2 — IMPLEMENTACIÓN PROGRESIVA",
-    "FASE 3 — ACCESIBILIDAD Y SEO",
-    "FASE 4 — OPTIMIZACIÓN",
-    "FASE 5 — QUALITY CHECK FINAL",
-]
-
-
-def _normalize_phase_name(name: str) -> str:
-    return re.sub(r"\s+", " ", (name or "").strip().lower())
-
-
-def _is_rigid_phase(name: str, rigid_name: str) -> bool:
-    norm = _normalize_phase_name(name)
-    rigid = _normalize_phase_name(rigid_name)
-    return rigid in norm or norm in rigid
-
-
-def _enforce_rigid_pipeline(plan: dict) -> dict:
-    phases = list(plan.get("phases", []))
-    if not phases:
-        return {"phases": []}
-
-    selected = []
-    for rigid in RIGID_PHASES:
-        found = next((p for p in phases if _is_rigid_phase(p.get("name", ""), rigid)), None)
-        if found:
-            selected.append({
-                "name": rigid,
-                "description": found.get("description", rigid),
-                "depends_on": [selected[-1]["name"]] if selected else [],
-            })
-            continue
-        selected.append({
-            "name": rigid,
-            "description": rigid,
-            "depends_on": [selected[-1]["name"]] if selected else [],
-        })
-
-    return {"phases": selected}
-
-
 def _validate_phase_action_limits(actions_payload: dict, phase_name: str) -> None:
     actions = list(actions_payload.get("actions", []))
     if len(actions) > MAX_ACTIONS_PER_PHASE:
@@ -252,6 +209,38 @@ def _run_precheck_phase(
 
     state.complete_phase("FASE 0 — PRE-CHECK")
     state.reset_phase()
+
+
+
+def _ensure_tracking_dirs(task_workspace: Path) -> dict[str, Path]:
+    tracking_root = task_workspace / "seguimiento"
+    execution_root = task_workspace / "ejecucion"
+    tracking_root.mkdir(parents=True, exist_ok=True)
+    execution_root.mkdir(parents=True, exist_ok=True)
+    return {"tracking": tracking_root, "execution": execution_root}
+
+
+def _save_phase_artifacts(dirs: dict[str, Path], phase_name: str, actions_payload: dict, results: list[dict]) -> None:
+    safe = re.sub(r"[^a-zA-Z0-9_-]+", "_", (phase_name or "phase").strip().lower()).strip("_") or "phase"
+    (dirs["tracking"] / f"{safe}_plan.json").write_text(
+        json.dumps(actions_payload, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+    (dirs["execution"] / f"{safe}_results.json").write_text(
+        json.dumps(results, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+
+
+def _print_phase_checklist(phase_name: str, actions: list[dict], results: list[dict]) -> None:
+    print(f"  {C.CYAN}Checklist de ejecución: {phase_name}{C.RESET}")
+    for idx, action in enumerate(actions, 1):
+        result = results[idx - 1] if idx - 1 < len(results) else {}
+        ok = bool(result.get("ok", False))
+        icon = "✅" if ok else "❌"
+        detail = action.get("path") or action.get("command") or action.get("prompt", "")[:60]
+        print(f"    {icon} [{idx}/{len(actions)}] {action.get('type','unknown')}: {detail}")
+
 
 def _sort_phases(plan: dict) -> list[dict]:
     phases = plan.get("phases", [])
@@ -796,9 +785,9 @@ def run_orchestrator(
     else:
         raise PlannerError("No se pudo obtener un plan maestro estructuralmente válido.")
 
-    master_plan = _enforce_rigid_pipeline(master_plan)
 
     phase_results: list[dict] = []
+    tracking_dirs = _ensure_tracking_dirs(task_workspace)
     orchestration_warnings: list[str] = []
     _run_precheck_phase(state, executor, preferred_site, runtime_env, phase_results)
 
@@ -881,6 +870,8 @@ def run_orchestrator(
 
         try:
             results = executor.execute_actions(actions_payload, state)
+            _save_phase_artifacts(tracking_dirs, phase_name, actions_payload, results)
+            _print_phase_checklist(phase_name, actions, results)
             _sync_state_before_phase(state, task_workspace)
             state.increment_iteration()
             LoopGuard.check(state)
