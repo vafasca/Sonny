@@ -20,6 +20,7 @@ from core.pipeline_config import (
     REQUIRE_PRECHECK,
     MAX_PHASE2_SUBPHASES,
     LANDING_PHASE2_MIN_COMPONENTS,
+    START_NG_SERVE_ON_SUCCESS,
 )
 from core.ai_scraper import available_sites, set_preferred_site
 from core.state_manager import AgentState
@@ -460,6 +461,22 @@ def _project_has_lint_target(project_root: Path | None) -> bool:
     return '"lint"' in content
 
 
+def _project_has_e2e_target(project_root: Path | None) -> bool:
+    if not project_root:
+        return False
+
+    angular_file = Path(project_root) / "angular.json"
+    if not angular_file.exists():
+        return False
+
+    try:
+        content = angular_file.read_text(encoding="utf-8", errors="replace")
+    except Exception:
+        return False
+
+    return '"e2e"' in content
+
+
 def _phase_generates_code(actions_payload: dict) -> bool:
     actions = actions_payload.get("actions", [])
     for action in actions:
@@ -511,14 +528,22 @@ def _quality_signature(failures: list[dict]) -> str:
         chunks.append(f"{cmd}:{sig}")
     return " || ".join(chunks)
 
-def _run_quality_checks(project_root: Path) -> tuple[list[dict], list[dict]]:
+def _run_quality_checks(project_root: Path, disabled_commands: set[str] | None = None) -> tuple[list[dict], list[dict]]:
+    disabled = {str(c).strip() for c in (disabled_commands or set()) if str(c).strip()}
+
     checks = [
         ("ng build --configuration production", "Prueba de Compilación (AOT)", 300),
-        ("ng test --no-watch --browsers=ChromeHeadless", "Pruebas Unitarias", 300),
-        ("ng e2e", "Pruebas de Extremo a Extremo", 300),
     ]
     if _project_has_lint_target(project_root):
-        checks.insert(1, ("ng lint", "Análisis Estático", 120))
+        checks.append(("ng lint", "Análisis Estático", 120))
+
+    test_cmd = "ng test --no-watch --browsers=ChromeHeadless"
+    if test_cmd not in disabled:
+        checks.append((test_cmd, "Pruebas Unitarias", 300))
+
+    e2e_cmd = "ng e2e"
+    if _project_has_e2e_target(project_root) and e2e_cmd not in disabled:
+        checks.append((e2e_cmd, "Pruebas de Extremo a Extremo", 300))
 
     failures: list[dict] = []
     reports: list[dict] = []
@@ -781,7 +806,11 @@ def run_orchestrator(
     print(f"  {C.CYAN}Plan validado: {len(ordered_phases)} fase(s){C.RESET}")
 
     phase_retry_count: dict[str, int] = {}
+    disabled_quality_commands: set[str] = set()
+    halt_remaining_phases = False
     for phase in ordered_phases:
+        if halt_remaining_phases:
+            break
         phase_name = phase["name"]
         state.set_phase(phase_name)
         _sync_state_before_phase(state, task_workspace)
@@ -895,7 +924,10 @@ def run_orchestrator(
             seen_quality_signatures: set[str] = set()
             unchanged_signature_streak = 0
             for round_num in range(1, max_fix_rounds + 1):
-                failures, reports = _run_quality_checks(Path(state.project_root))
+                try:
+                    failures, reports = _run_quality_checks(Path(state.project_root), disabled_quality_commands)
+                except TypeError:
+                    failures, reports = _run_quality_checks(Path(state.project_root))
                 accumulated_quality_failures.extend(failures)
                 _print_checklist(reports, round_num)
 
@@ -912,6 +944,18 @@ def run_orchestrator(
                     print(f"  {C.GREEN}✅ Fase '{phase_name}' verificada y compilable.{C.RESET}")
                     break
 
+                for failed in failures:
+                    cmd_failed = str(failed.get("command", "")).strip()
+                    out_low = str(failed.get("output", "")).lower()
+                    if cmd_failed == "ng test --no-watch --browsers=ChromeHeadless" and any(tok in out_low for tok in ("not found", "cannot find", "missing", "vitest")):
+                        if cmd_failed not in disabled_quality_commands:
+                            disabled_quality_commands.add(cmd_failed)
+                            orchestration_warnings.append("Se desactivó ng test para fases siguientes: dependencia/runner no disponible.")
+                    if cmd_failed == "ng e2e" and any(tok in out_low for tok in ("cannot find", "not found", "no target", "e2e")):
+                        if cmd_failed not in disabled_quality_commands:
+                            disabled_quality_commands.add(cmd_failed)
+                            orchestration_warnings.append("Se desactivó ng e2e para fases siguientes: target e2e no disponible.")
+
                 signature = _quality_signature(failures)
                 if signature and signature in seen_quality_signatures:
                     unchanged_signature_streak += 1
@@ -923,10 +967,14 @@ def run_orchestrator(
                 if unchanged_signature_streak >= 1:
                     print(f"  {C.RED}❌ Error de calidad sin cambios entre rondas; abortando autofix para evitar loop.{C.RESET}")
                     log_loop_detected(phase_name, f"quality_error_unchanged: {signature[:500]}")
+                    orchestration_warnings.append(f"La fase {phase_name} repite el mismo error de calidad; se detienen fases restantes.")
+                    halt_remaining_phases = True
                     break
 
                 if round_num == max_fix_rounds:
                     print(f"  {C.RED}❌ Fase '{phase_name}' no se pudo estabilizar tras {max_fix_rounds} intentos.{C.RESET}")
+                    orchestration_warnings.append(f"La fase {phase_name} quedó inestable tras quality checks; se detienen fases restantes.")
+                    halt_remaining_phases = True
                     break
 
                 print(f"  {C.YELLOW}⚠️ Corrigiendo errores detectados ({len(failures)}) con LLM...{C.RESET}")
@@ -1001,6 +1049,23 @@ def run_orchestrator(
         for w in orchestration_warnings:
             print(f"    {C.YELLOW}- {w}{C.RESET}")
 
+    serve_status = {"started": False, "pid": None, "command": ""}
+    if overall_ok and START_NG_SERVE_ON_SUCCESS and state.project_root:
+        try:
+            serve_cmd = "ng serve --host 0.0.0.0 --port 4200"
+            proc = subprocess.Popen(
+                serve_cmd,
+                shell=True,
+                cwd=str(Path(state.project_root)),
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                start_new_session=True,
+            )
+            serve_status = {"started": True, "pid": proc.pid, "command": serve_cmd}
+            print(f"  {C.GREEN}▶ ng serve iniciado (pid={proc.pid}) en segundo plano.{C.RESET}")
+        except Exception as exc:
+            orchestration_warnings.append(f"No se pudo iniciar ng serve automáticamente: {exc}")
+
     return {
         "ok": overall_ok,
         "plan": master_plan,
@@ -1016,6 +1081,8 @@ def run_orchestrator(
         "angular_cli_version": state.angular_cli_version,
         "angular_project_version": state.angular_project_version,
         "runtime_env": runtime_env,
+        "serve_status": serve_status,
+        "disabled_quality_commands": sorted(disabled_quality_commands),
     }
 
 

@@ -531,7 +531,7 @@ export class AppComponent {}""",
             orch_mod._run_cmd_utf8 = original
 
         self.assertEqual(failures, [])
-        self.assertEqual(len(reports), 3)
+        self.assertEqual(len(reports), 2)
         self.assertNotIn("ng lint", called_commands)
 
     def test_run_quality_checks_includes_lint_with_target(self):
@@ -549,8 +549,27 @@ export class AppComponent {}""",
             orch_mod._run_cmd_utf8 = original
 
         self.assertEqual(failures, [])
-        self.assertEqual(len(reports), 4)
+        self.assertEqual(len(reports), 3)
         self.assertIn("ng lint", called_commands)
+
+
+    def test_run_quality_checks_includes_e2e_with_target(self):
+        base = Path(tempfile.mkdtemp(prefix="sonny_quality_with_e2e_"))
+        project = base / "proj"
+        project.mkdir(parents=True, exist_ok=True)
+        (project / "angular.json").write_text('{"projects":{"app":{"architect":{"e2e":{}}}}}', encoding="utf-8")
+
+        called_commands: list[str] = []
+        original = orch_mod._run_cmd_utf8
+        orch_mod._run_cmd_utf8 = lambda cmd, cwd=None, timeout=30: (called_commands.append(cmd) or (0, "ok"))
+        try:
+            failures, reports = orch_mod._run_quality_checks(project)
+        finally:
+            orch_mod._run_cmd_utf8 = original
+
+        self.assertEqual(failures, [])
+        self.assertEqual(len(reports), 3)
+        self.assertIn("ng e2e", called_commands)
 
     def test_autofix_context_accumulates_quality_failures(self):
         base = Path(tempfile.mkdtemp(prefix="sonny_autofix_ctx_"))
@@ -573,9 +592,12 @@ export class AppComponent {}""",
         original_quality = orch_mod._run_quality_checks
         original_autofix = orch_mod._autofix_with_llm
         original_require_precheck = orch_mod.REQUIRE_PRECHECK
+        original_autoserve = orch_mod.START_NG_SERVE_ON_SUCCESS
 
         orch_mod._build_task_workspace = lambda user_request, workspace=None: task
         orch_mod.REQUIRE_PRECHECK = False
+        orch_mod.START_NG_SERVE_ON_SUCCESS = False
+        orch_mod.START_NG_SERVE_ON_SUCCESS = False
         orch_mod.detect_angular_cli_version = lambda: "21.1.5"
         orch_mod.detect_node_npm_os = lambda: {"node": "v20", "npm": "10", "os": "Linux"}
 
@@ -621,6 +643,7 @@ export class AppComponent {}""",
             orch_mod._run_quality_checks = original_quality
             orch_mod._autofix_with_llm = original_autofix
             orch_mod.REQUIRE_PRECHECK = original_require_precheck
+            orch_mod.START_NG_SERVE_ON_SUCCESS = original_autoserve
 
         self.assertTrue(result["ok"])
         self.assertEqual(len(captured_contexts), 2)
@@ -996,11 +1019,13 @@ export class AppComponent {}""",
         original_get_corrected = orch_mod.get_corrected_phase_actions
         original_quality = orch_mod._run_quality_checks
         original_precheck = orch_mod.REQUIRE_PRECHECK
+        original_autoserve = orch_mod.START_NG_SERVE_ON_SUCCESS
 
         orch_mod._build_task_workspace = lambda user_request, workspace=None: task
         orch_mod.detect_angular_cli_version = lambda: "21.1.5"
         orch_mod.detect_node_npm_os = lambda: {"node": "v20", "npm": "10", "os": "Linux"}
         orch_mod.REQUIRE_PRECHECK = False
+        orch_mod.START_NG_SERVE_ON_SUCCESS = False
 
         def fake_ensure(task_workspace, state, user_request):
             state.set_project_root(project)
@@ -1041,6 +1066,7 @@ export class AppComponent {}""",
             orch_mod.get_corrected_phase_actions = original_get_corrected
             orch_mod._run_quality_checks = original_quality
             orch_mod.REQUIRE_PRECHECK = original_precheck
+            orch_mod.START_NG_SERVE_ON_SUCCESS = original_autoserve
 
         self.assertGreaterEqual(calls["corrected"], 1)
         self.assertIn("phase_results", result)
