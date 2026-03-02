@@ -14,7 +14,7 @@ ai_scraper_stub.available_sites = lambda: ["chatgpt", "claude", "gemini", "qwen"
 sys.modules["core.ai_scraper"] = ai_scraper_stub
 
 from core.agent import ExecutorError, execute_command, modify_file, write_file, _block_interactive_commands, ActionExecutor, _split_actions_into_subfases
-from core.orchestrator import _build_task_workspace, _parse_angular_cli_version, _snapshot_project_files, _strip_ansi, _build_angular_rules, _validate_action_consistency, _sanitize_project_name, _build_ng_new_command, _project_has_lint_target, _enforce_rigid_pipeline, _extract_error_signature
+from core.orchestrator import _build_task_workspace, _parse_angular_cli_version, _snapshot_project_files, _strip_ansi, _build_angular_rules, _validate_action_consistency, _sanitize_project_name, _build_ng_new_command, _project_has_lint_target, _enforce_rigid_pipeline, _extract_error_signature, _phase_has_minimum_deliverable, _objective_related_components, _was_last_production_build_successful
 from core.state_manager import AgentState
 from core import planner as planner_mod
 import core.agent as agent_mod
@@ -871,6 +871,36 @@ export class AppComponent {}""",
         signature = _extract_error_signature("line\nX [ERROR] Cannot find name 'x'\nTS2304: foo")
         self.assertIn("ERROR", signature)
         self.assertIn("TS2304", signature)
+
+    def test_phase2_requires_component_under_components_folder(self):
+        base = Path(tempfile.mkdtemp(prefix="sonny_phase2_deliverable_"))
+        project = base / "proj"
+        (project / "src" / "app").mkdir(parents=True, exist_ok=True)
+        ok, msg = _phase_has_minimum_deliverable(
+            "FASE 2 — IMPLEMENTACIÓN PROGRESIVA",
+            project,
+            "desarrolla una landing page en angular",
+        )
+        self.assertFalse(ok)
+        self.assertIn("src/app/components", msg)
+
+    def test_objective_related_components_detects_created_component(self):
+        base = Path(tempfile.mkdtemp(prefix="sonny_objective_components_"))
+        project = base / "proj"
+        comp = project / "src" / "app" / "components" / "bar-menu"
+        comp.mkdir(parents=True, exist_ok=True)
+        (comp / "bar-menu.component.ts").write_text("export class BarMenuComponent {}", encoding="utf-8")
+
+        related = _objective_related_components(project, "landing page para bar")
+        self.assertTrue(related)
+        self.assertTrue(any("bar-menu.component.ts" in item for item in related))
+
+    def test_last_production_build_successful_helper(self):
+        phase_results = [
+            {"phase": "x", "results": [{"command": "ng build --configuration production", "ok": False}]},
+            {"phase": "y", "results": [{"command": "ng build --configuration production", "ok": True}]},
+        ]
+        self.assertTrue(_was_last_production_build_successful(phase_results))
 
 
 if __name__ == "__main__":

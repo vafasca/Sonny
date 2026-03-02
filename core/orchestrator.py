@@ -642,6 +642,57 @@ def _validate_action_consistency(actions_payload: dict, context: dict) -> None:
                 )
 
 
+
+
+def _phase_has_minimum_deliverable(phase_name: str, project_root: Path | None, user_request: str) -> tuple[bool, str]:
+    if not project_root or not _is_angular_request(user_request):
+        return True, ""
+
+    low = (phase_name or "").lower()
+    if "fase 2" not in low:
+        return True, ""
+
+    components_dir = Path(project_root) / "src" / "app" / "components"
+    if not components_dir.exists():
+        return False, "Fase 2 incompleta: no existe src/app/components/ con componentes nuevos."
+
+    component_files = [
+        p for p in components_dir.rglob("*.component.ts")
+        if p.is_file()
+    ]
+    if not component_files:
+        return False, "Fase 2 incompleta: no se detectó ningún *.component.ts en src/app/components/."
+
+    return True, ""
+
+
+def _objective_related_components(project_root: Path | None, user_request: str) -> list[str]:
+    if not project_root or not _is_angular_request(user_request):
+        return []
+
+    components_root = Path(project_root) / "src" / "app" / "components"
+    if not components_root.exists():
+        return []
+
+    tokens = [t for t in re.findall(r"[a-záéíóúñ]{3,}", (user_request or "").lower()) if t not in {"para", "con", "una", "landing", "page", "angular"}]
+    files = [str(p.relative_to(project_root)).replace("\\", "/") for p in components_root.rglob("*.component.ts") if p.is_file()]
+    if not files:
+        return []
+    if not tokens:
+        return files
+
+    matched = [f for f in files if any(tok in f.lower() for tok in tokens)]
+    return matched or files
+
+
+def _was_last_production_build_successful(phase_results: list[dict]) -> bool:
+    for phase in reversed(phase_results):
+        for item in reversed(list(phase.get("results", []) or [])):
+            cmd = str(item.get("command", ""))
+            if cmd.strip() == "ng build --configuration production":
+                return bool(item.get("ok"))
+    return False
+
 def run_orchestrator(
     user_request: str,
     workspace: Path | None = None,
@@ -675,6 +726,7 @@ def run_orchestrator(
     master_plan = _enforce_rigid_pipeline(master_plan)
 
     phase_results: list[dict] = []
+    orchestration_warnings: list[str] = []
     _run_precheck_phase(state, executor, preferred_site, runtime_env, phase_results)
 
     ordered_phases = _sort_phases(master_plan)
@@ -737,7 +789,12 @@ def run_orchestrator(
             _sync_state_before_phase(state, task_workspace)
             state.increment_iteration()
             LoopGuard.check(state)
-            state.complete_phase(phase_name)
+            deliverable_ok, deliverable_warning = _phase_has_minimum_deliverable(phase_name, Path(state.project_root) if state.project_root else None, user_request)
+            if deliverable_ok:
+                state.complete_phase(phase_name)
+            else:
+                orchestration_warnings.append(deliverable_warning)
+                log_validation_failed(f"deliverable:{phase_name}", deliverable_warning)
             state.reset_phase()
             phase_results.append(
                 {
@@ -851,13 +908,34 @@ def run_orchestrator(
                     log_error("orchestrator", f"Auto-fix de calidad falló en fase '{phase_name}': {exc}")
                     break
 
-    print(f"  {C.GREEN}✅ Orquestación finalizada.{C.RESET}")
+    objective_components = _objective_related_components(Path(state.project_root) if state.project_root else None, user_request)
+    last_prod_build_ok = _was_last_production_build_successful(phase_results)
+    objective_verified = True
+    if _is_angular_request(user_request):
+        objective_verified = bool(objective_components)
+        if not objective_verified:
+            orchestration_warnings.append("No se generaron componentes en src/app/components/ relacionados al objetivo.")
+        if not last_prod_build_ok:
+            orchestration_warnings.append("El último ng build --configuration production no fue exitoso.")
+
+    overall_ok = (not orchestration_warnings) and objective_verified and (last_prod_build_ok if _is_angular_request(user_request) else True)
+    if overall_ok:
+        print(f"  {C.GREEN}✅ Orquestación finalizada.{C.RESET}")
+    else:
+        print(f"  {C.YELLOW}⚠️ Orquestación finalizada con advertencias.{C.RESET}")
+        for w in orchestration_warnings:
+            print(f"    {C.YELLOW}- {w}{C.RESET}")
+
     return {
-        "ok": True,
+        "ok": overall_ok,
         "plan": master_plan,
         "completed_phases": state.completed_phases,
         "iterations": state.iteration_count,
         "phase_results": phase_results,
+        "warnings": orchestration_warnings,
+        "objective_verified": objective_verified,
+        "objective_components": objective_components,
+        "last_production_build_ok": last_prod_build_ok,
         "task_workspace": str(task_workspace),
         "project_root": str(state.project_root) if state.project_root else "",
         "angular_cli_version": state.angular_cli_version,
