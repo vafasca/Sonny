@@ -249,6 +249,32 @@ def _parse_nested_actions_payload(raw: str) -> dict | None:
     return None
 
 
+
+
+def _is_ignored_context_path(rel_path: str) -> bool:
+    norm = str(rel_path or "").replace("\\", "/").lower()
+    ignored_parts = ("node_modules/", ".angular/", "dist/", ".git/")
+    return any(part in norm for part in ignored_parts)
+
+
+def _priority_context_paths(project_root: Path) -> list[str]:
+    preferred = [
+        "src/main.ts",
+        "src/app/app.ts",
+        "src/app/app.html",
+        "src/app/app.config.ts",
+        "src/app/app.routes.ts",
+        "src/styles.scss",
+        "angular.json",
+        "package.json",
+    ]
+    out: list[str] = []
+    for rel in preferred:
+        full = (project_root / rel).resolve()
+        if full.exists() and full.is_file():
+            out.append(rel)
+    return out
+
 def _collect_project_file_context(prompt: str, state: AgentState | None) -> str:
     if state is None or not state.project_root:
         return ""
@@ -279,9 +305,11 @@ def _collect_project_file_context(prompt: str, state: AgentState | None) -> str:
         if any(kw in low for kw in keywords):
             selected_exts.update(exts)
 
-    candidate_rel_paths: list[str] = []
+    candidate_rel_paths: list[str] = _priority_context_paths(project_root)
     if selected_exts:
-        for file in sorted(project_root.rglob("*")):
+        app_dir = project_root / "src" / "app"
+        scan_root = app_dir if app_dir.exists() else project_root
+        for file in sorted(scan_root.rglob("*")):
             if not file.is_file():
                 continue
             if file.suffix.lower() not in selected_exts:
@@ -290,16 +318,21 @@ def _collect_project_file_context(prompt: str, state: AgentState | None) -> str:
                 rel = file.relative_to(project_root)
             except ValueError:
                 continue
-            candidate_rel_paths.append(str(rel).replace("\\", "/"))
+            rel_norm = str(rel).replace("\\", "/")
+            if _is_ignored_context_path(rel_norm):
+                continue
+            candidate_rel_paths.append(rel_norm)
 
     # Si el prompt menciona rutas explícitas, priorizarlas.
     explicit_paths = re.findall(r"(?:src/[\w\-./]+\.(?:ts|html|scss|css|md))", prompt or "", flags=re.IGNORECASE)
-    candidate_rel_paths.extend(explicit_paths)
+    candidate_rel_paths = [*explicit_paths, *candidate_rel_paths]
 
     selected: list[str] = []
     seen = set()
     for rel in candidate_rel_paths:
         norm = rel.replace("\\", "/")
+        if _is_ignored_context_path(norm):
+            continue
         if norm in seen:
             continue
         seen.add(norm)
@@ -338,7 +371,7 @@ def _collect_project_file_context(prompt: str, state: AgentState | None) -> str:
             tree = [
                 str(p.relative_to(project_root)).replace("\\", "/")
                 for p in sorted(app_dir.rglob("*"))
-                if p.is_file()
+                if p.is_file() and not _is_ignored_context_path(str(p.relative_to(project_root)).replace("\\", "/"))
             ]
             if tree:
                 blocks.append(

@@ -471,6 +471,44 @@ def _phase_generates_code(actions_payload: dict) -> bool:
     return False
 
 
+
+MAX_CHECK_OUTPUT_CHARS = 20000
+
+
+def _compact_output(text: str, limit: int = MAX_CHECK_OUTPUT_CHARS) -> str:
+    raw = str(text or "")
+    if len(raw) <= limit:
+        return raw
+    head = raw[: limit // 2]
+    tail = raw[-(limit // 2):]
+    return f"{head}\n...<output truncated>...\n{tail}"
+
+
+def _extract_error_signature(text: str) -> str:
+    lines = []
+    for line in str(text or "").splitlines():
+        low = line.lower()
+        if any(tok in low for tok in ("error", "ts", "cannot", "failed", "x [error]", "✘")):
+            normalized = re.sub(r"\s+", " ", line).strip()
+            if normalized:
+                lines.append(normalized)
+        if len(lines) >= 8:
+            break
+    if not lines:
+        return ""
+    return " | ".join(lines)[:1200]
+
+
+def _quality_signature(failures: list[dict]) -> str:
+    if not failures:
+        return ""
+    chunks = []
+    for item in failures:
+        cmd = str(item.get("command", "")).strip()
+        sig = str(item.get("error_signature", "")).strip()
+        chunks.append(f"{cmd}:{sig}")
+    return " || ".join(chunks)
+
 def _run_quality_checks(project_root: Path) -> tuple[list[dict], list[dict]]:
     checks = [
         ("ng build --configuration production", "Prueba de Compilación (AOT)", 300),
@@ -490,7 +528,8 @@ def _run_quality_checks(project_root: Path) -> tuple[list[dict], list[dict]]:
             "type": check_type,
             "ok": code == 0,
             "exit_code": code,
-            "output": out[-4000:],
+            "output": _compact_output(out),
+            "error_signature": _extract_error_signature(out),
         }
         reports.append(report)
         if code != 0:
@@ -504,6 +543,8 @@ def _print_checklist(reports: list[dict], round_num: int) -> None:
     for item in reports:
         icon = "✅" if item.get("ok") else "❌"
         print(f"    {icon} {item['command']} [{item['type']}]")
+        if not item.get("ok") and item.get("error_signature"):
+            print(f"      {C.DIM}{item.get('error_signature','')[:240]}{C.RESET}")
 
 
 def _autofix_with_llm(
@@ -539,7 +580,8 @@ def _build_angular_rules(project_structure: str, project_version: str) -> list[s
     elif project_structure == "standalone_components (NO NgModules)":
         rules += [
             "Usa componentes standalone (NO NgModules).",
-            "app.config.ts es central y puede modificarse si es necesario.",
+            "app.config.ts debe mantener ApplicationConfig y providers con provideRouter(routes).",
+            "NO cambies app.config.ts a objeto custom sin providers Angular.",
             "No crees app.module.ts salvo que exista explícitamente en el árbol real.",
         ]
     else:
@@ -578,6 +620,26 @@ def _validate_action_consistency(actions_payload: dict, context: dict) -> None:
             raise ValidationError(
                 "Acción inválida para standalone: no crees app.module.ts si no existe en el árbol real."
             )
+
+        if structure == "standalone_components (NO NgModules)" and path.endswith("src/app/app.ts"):
+            content = str(action.get("content", ""))
+            if "bootstrapApplication" in content:
+                raise ValidationError("Acción inválida para standalone: bootstrapApplication debe permanecer en src/main.ts, no en src/app/app.ts.")
+
+        if structure == "standalone_components (NO NgModules)" and path.endswith("src/app/app.config.ts"):
+            content = str(action.get("content", ""))
+            low_content = content.lower()
+            if "applicationconfig" not in low_content or "providerouter" not in low_content:
+                raise ValidationError(
+                    "Acción inválida para standalone: app.config.ts debe exportar ApplicationConfig e incluir provideRouter(routes)."
+                )
+
+        if structure == "standalone_components (NO NgModules)" and path.endswith("src/app/app.routes.ts"):
+            content = str(action.get("content", ""))
+            if "export const routes" not in content:
+                raise ValidationError(
+                    "Acción inválida para standalone: app.routes.ts debe exportar 'routes' para mantener compatibilidad con app.config.ts."
+                )
 
 
 def run_orchestrator(
@@ -698,6 +760,8 @@ def run_orchestrator(
             print(f"  {C.CYAN}▶ Verificando calidad tras fase: {phase_name}{C.RESET}")
             max_fix_rounds = 3
             accumulated_quality_failures: list[dict] = []
+            seen_quality_signatures: set[str] = set()
+            unchanged_signature_streak = 0
             for round_num in range(1, max_fix_rounds + 1):
                 failures, reports = _run_quality_checks(Path(state.project_root))
                 accumulated_quality_failures.extend(failures)
@@ -714,6 +778,19 @@ def run_orchestrator(
 
                 if not failures:
                     print(f"  {C.GREEN}✅ Fase '{phase_name}' verificada y compilable.{C.RESET}")
+                    break
+
+                signature = _quality_signature(failures)
+                if signature and signature in seen_quality_signatures:
+                    unchanged_signature_streak += 1
+                else:
+                    unchanged_signature_streak = 0
+                if signature:
+                    seen_quality_signatures.add(signature)
+
+                if unchanged_signature_streak >= 1:
+                    print(f"  {C.RED}❌ Error de calidad sin cambios entre rondas; abortando autofix para evitar loop.{C.RESET}")
+                    log_loop_detected(phase_name, f"quality_error_unchanged: {signature[:500]}")
                     break
 
                 if round_num == max_fix_rounds:

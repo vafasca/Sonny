@@ -14,7 +14,7 @@ ai_scraper_stub.available_sites = lambda: ["chatgpt", "claude", "gemini", "qwen"
 sys.modules["core.ai_scraper"] = ai_scraper_stub
 
 from core.agent import ExecutorError, execute_command, modify_file, write_file, _block_interactive_commands, ActionExecutor, _split_actions_into_subfases
-from core.orchestrator import _build_task_workspace, _parse_angular_cli_version, _snapshot_project_files, _strip_ansi, _build_angular_rules, _validate_action_consistency, _sanitize_project_name, _build_ng_new_command, _project_has_lint_target, _enforce_rigid_pipeline
+from core.orchestrator import _build_task_workspace, _parse_angular_cli_version, _snapshot_project_files, _strip_ansi, _build_angular_rules, _validate_action_consistency, _sanitize_project_name, _build_ng_new_command, _project_has_lint_target, _enforce_rigid_pipeline, _extract_error_signature
 from core.state_manager import AgentState
 from core import planner as planner_mod
 import core.agent as agent_mod
@@ -832,6 +832,45 @@ export class AppComponent {}""",
             agent_mod.subprocess.run = original_run
 
         self.assertEqual(captured["timeout"], agent_mod.TIMEOUT_NPM_INSTALL)
+
+    def test_collect_project_file_context_skips_node_modules(self):
+        base = Path(tempfile.mkdtemp(prefix="sonny_ctx_filter_"))
+        task = base / "task_ctx_filter"
+        project = task / "proj"
+        (project / "src" / "app").mkdir(parents=True, exist_ok=True)
+        (project / "node_modules" / "@algolia" / "abtesting").mkdir(parents=True, exist_ok=True)
+        (project / "src" / "app" / "app.ts").write_text("export class App {}", encoding="utf-8")
+        (project / "node_modules" / "@algolia" / "abtesting" / "index.ts").write_text("export const lib = 1", encoding="utf-8")
+
+        state = AgentState()
+        state.set_task_workspace(task)
+        state.set_project_root(project)
+
+        ctx = agent_mod._collect_project_file_context("analiza ts", state)
+        self.assertIn("src/app/app.ts", ctx)
+        self.assertNotIn("node_modules", ctx)
+
+    def test_validate_action_consistency_blocks_invalid_standalone_app_config(self):
+        context = {
+            "project_structure": "standalone_components (NO NgModules)",
+            "existing_files": ["src/app/app.ts", "src/app/app.config.ts"],
+        }
+        payload = {
+            "actions": [
+                {
+                    "type": "file_modify",
+                    "path": "src/app/app.config.ts",
+                    "content": "export const AppConfig = { apiUrl: 'x' };",
+                }
+            ]
+        }
+        with self.assertRaises(ValidationError):
+            _validate_action_consistency(payload, context)
+
+    def test_extract_error_signature_reads_error_lines(self):
+        signature = _extract_error_signature("line\nX [ERROR] Cannot find name 'x'\nTS2304: foo")
+        self.assertIn("ERROR", signature)
+        self.assertIn("TS2304", signature)
 
 
 if __name__ == "__main__":
