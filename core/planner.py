@@ -160,19 +160,23 @@ def _ask_json(prompt: str, preferred_site: str | None = None) -> dict:
 
 def get_master_plan(user_request: str, preferred_site: str | None = None) -> dict:
     prompt = (
-        "Genera un plan maestro para ejecutar la solicitud del usuario con fases rígidas y validación incremental.\n"
-        "Incluye exactamente estas fases (puedes agregar subfases internas si hace falta):\n"
-        "1) FASE 1 — ESTRUCTURA ARQUITECTÓNICA\n"
-        "2) FASE 2 — IMPLEMENTACIÓN PROGRESIVA\n"
-        "3) FASE 3 — ACCESIBILIDAD Y SEO\n"
-        "4) FASE 4 — OPTIMIZACIÓN\n"
-        "5) FASE 5 — QUALITY CHECK FINAL\n"
+        "Genera un plan maestro para ejecutar la solicitud del usuario.\n"
+        "La IA debe DECIDIR por sí sola la serie específica de fases/pasos,\n"
+        "desde planificación hasta validaciones y pruebas finales.\n"
+        "No uses fases rígidas predefinidas ni nombres obligatorios.\n"
+        "Cada fase debe ser ejecutable por un agente que solo ejecuta acciones,\n"
+        "guarda trazabilidad y muestra checklist en terminal.\n"
         "Formato obligatorio:\n"
         "{\n"
         '  "phases": [\n'
         '    {"name": "...", "description": "...", "depends_on": []}\n'
         "  ]\n"
         "}\n"
+        "Reglas del plan:\n"
+        "- Incluye al menos una fase de planificación/análisis.\n"
+        "- Incluye al menos una fase de implementación/ejecución.\n"
+        "- Incluye al menos una fase de validación/pruebas/calidad final.\n"
+        "- depends_on debe referenciar nombres reales de fases previas cuando aplique.\n"
         f"Solicitud del usuario: {user_request}"
     )
     return _ask_json(prompt, preferred_site=preferred_site)
