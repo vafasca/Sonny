@@ -924,6 +924,95 @@ export class AppComponent {}""",
         ]
         self.assertTrue(_was_last_production_build_successful(phase_results))
 
+    def test_planner_builds_minimal_correction_prompt(self):
+        captured = {"prompt": ""}
+
+        def fake_call(prompt: str) -> str:
+            captured["prompt"] = prompt
+            return '{"actions": [{"type": "command", "command": "ng build"}]}'
+
+        planner_mod.call_llm = fake_call
+        planner_mod.get_corrected_phase_actions(
+            "FASE 1 — ESTRUCTURA ARQUITECTÓNICA",
+            {"actions": [{"type": "file_write", "path": "src/app/app.config.ts", "content": "x"}]},
+            "app.config.ts debe exportar ApplicationConfig",
+            {
+                "project_structure": "standalone_components (NO NgModules)",
+                "angular_project_version": "^21.1.0",
+                "runtime_env": {"node": "v20"},
+                "existing_files": ["src/app/app.ts", "src/app/app.config.ts"],
+                "app_tree": ["src/app/app.ts", "src/app/app.config.ts"],
+            },
+        )
+
+        self.assertIn("Corrige únicamente las acciones inválidas", captured["prompt"])
+        self.assertIn("ACCIONES PREVIAS (JSON)", captured["prompt"])
+        self.assertNotIn("COMANDOS VÁLIDOS", captured["prompt"])
+
+    def test_orchestrator_retries_invalid_actions_with_correction_prompt(self):
+        base = Path(tempfile.mkdtemp(prefix="sonny_retry_actions_"))
+        task = base / "task"
+        project = task / "proj"
+        (project / "src" / "app" / "components" / "bar-menu").mkdir(parents=True, exist_ok=True)
+        (project / "src" / "app" / "components" / "bar-menu" / "bar-menu.component.ts").write_text("export class BarMenuComponent {}", encoding="utf-8")
+        (project / "src" / "main.ts").write_text("console.log(1)", encoding="utf-8")
+        (project / "angular.json").write_text("{}", encoding="utf-8")
+        (project / "package.json").write_text("{}", encoding="utf-8")
+
+        calls = {"phase": 0, "corrected": 0}
+        original_build_task = orch_mod._build_task_workspace
+        original_detect_cli = orch_mod.detect_angular_cli_version
+        original_detect_env = orch_mod.detect_node_npm_os
+        original_ensure = orch_mod._ensure_angular_project_initialized
+        original_get_master = orch_mod.get_master_plan
+        original_get_actions = orch_mod.get_phase_actions
+        original_get_corrected = orch_mod.get_corrected_phase_actions
+        original_quality = orch_mod._run_quality_checks
+        original_precheck = orch_mod.REQUIRE_PRECHECK
+
+        orch_mod._build_task_workspace = lambda user_request, workspace=None: task
+        orch_mod.detect_angular_cli_version = lambda: "21.1.5"
+        orch_mod.detect_node_npm_os = lambda: {"node": "v20", "npm": "10", "os": "Linux"}
+        orch_mod.REQUIRE_PRECHECK = False
+
+        def fake_ensure(task_workspace, state, user_request):
+            state.set_project_root(project)
+            state.angular_project_version = "21.1.5"
+
+        orch_mod._ensure_angular_project_initialized = fake_ensure
+        orch_mod.get_master_plan = lambda user_request, preferred_site=None: {
+            "phases": [{"name": "FASE 1 — ESTRUCTURA ARQUITECTÓNICA", "description": "x", "depends_on": []}]
+        }
+
+        def bad_actions(phase_name, context, preferred_site=None):
+            calls["phase"] += 1
+            return {"actions": [{"type": "file_write", "path": "src/app/app.module.ts", "content": "x"}]}
+
+        def corrected_actions(phase_name, previous_actions_payload, validation_error, context, preferred_site=None):
+            calls["corrected"] += 1
+            safe_name = re.sub(r"[^a-z0-9]+", "-", phase_name.lower()).strip("-")
+            return {"actions": [{"type": "file_write", "path": f"src/app/components/{safe_name}/{safe_name}.component.ts", "content": "export class XComponent {}"}]}
+
+        orch_mod.get_phase_actions = bad_actions
+        orch_mod.get_corrected_phase_actions = corrected_actions
+        orch_mod._run_quality_checks = lambda project_root: ([], [{"command": "ng build --configuration production", "ok": True, "type": "build", "output": ""}])
+
+        try:
+            result = orch_mod.run_orchestrator("desarrolla una landing page en angular para bar")
+        finally:
+            orch_mod._build_task_workspace = original_build_task
+            orch_mod.detect_angular_cli_version = original_detect_cli
+            orch_mod.detect_node_npm_os = original_detect_env
+            orch_mod._ensure_angular_project_initialized = original_ensure
+            orch_mod.get_master_plan = original_get_master
+            orch_mod.get_phase_actions = original_get_actions
+            orch_mod.get_corrected_phase_actions = original_get_corrected
+            orch_mod._run_quality_checks = original_quality
+            orch_mod.REQUIRE_PRECHECK = original_precheck
+
+        self.assertGreaterEqual(calls["corrected"], 1)
+        self.assertIn("phase_results", result)
+
 
 if __name__ == "__main__":
     unittest.main()

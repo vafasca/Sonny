@@ -358,3 +358,40 @@ def get_phase_actions(phase_name: str, context: dict, preferred_site: str | None
         )
 
     return _ask_json(prompt, preferred_site=preferred_site)
+
+
+def get_corrected_phase_actions(
+    phase_name: str,
+    previous_actions_payload: dict,
+    validation_error: str,
+    context: dict,
+    preferred_site: str | None = None,
+) -> dict:
+    runtime = context.get("runtime_env", {})
+    structure = context.get("project_structure", "unknown")
+    existing = _dedupe_keep_order(list(context.get("existing_files", []) or []), 30)
+    app_tree = _dedupe_keep_order(list(context.get("app_tree", []) or []), 60)
+
+    prev_json = json.dumps(previous_actions_payload, ensure_ascii=False, indent=2)
+    prompt = (
+        f"La acción anterior fue bloqueada en la fase '{phase_name}' por esta razón:\n"
+        f"- {validation_error}\n\n"
+        "Corrige únicamente las acciones inválidas. Mantén el resto si son válidas.\n"
+        "No cambies formato JSON ni tipos de acción.\n"
+        "No asumas archivos inexistentes. Respeta nombres detectados (ej: app.ts, app.html, app.scss).\n"
+        "Si estructura es standalone, no crees app.module.ts ni NgModules.\n"
+        "Si tocas app.config.ts en standalone: exporta ApplicationConfig e incluye provideRouter(routes).\n"
+        "Si archivo no existe, usa file_write; si existe, file_modify.\n\n"
+        "CONTEXTO MÍNIMO:\n"
+        f"- Arquitectura: {structure}\n"
+        f"- Angular: {context.get('angular_project_version', 'unknown')}\n"
+        f"- Node: {runtime.get('node', 'unknown')}\n"
+        "- Archivos existentes:\n"
+        + "\n".join(f"  • {f}" for f in existing)
+        + "\n- Árbol src/app:\n"
+        + ("\n".join(f"  • {f}" for f in app_tree) if app_tree else "  • (vacío/no detectado)")
+        + "\n\nACCIONES PREVIAS (JSON):\n"
+        + prev_json
+        + "\n\nResponde SOLO con JSON válido con formato {\"actions\": [...]}"
+    )
+    return _ask_json(prompt, preferred_site=preferred_site)

@@ -13,7 +13,7 @@ from pathlib import Path
 
 from core.agent import ActionExecutor
 from core.loop_guard import LoopGuard, LoopGuardError
-from core.planner import PlannerError, get_master_plan, get_phase_actions
+from core.planner import PlannerError, get_master_plan, get_phase_actions, get_corrected_phase_actions
 from core.pipeline_config import (
     MAX_ACTIONS_PER_PHASE,
     MAX_LLM_CALLS_PER_PHASE,
@@ -782,15 +782,32 @@ def run_orchestrator(
             "angular_rules": _build_angular_rules(snap["structure"], state.angular_project_version),
         }
 
-        try:
-            actions_payload = get_phase_actions(phase_name, context, preferred_site=preferred_site)
-            validate_actions(actions_payload)
-            _validate_phase_action_limits(actions_payload, phase_name)
-            _validate_action_consistency(actions_payload, context)
-        except ValidationError as exc:
-            log_validation_failed(f"acciones:{phase_name}", str(exc))
-            log_action_blocked("phase_actions", str(exc))
-            raise
+        actions_payload = None
+        last_validation_error = ""
+        max_action_fix_retries = 2
+        for attempt in range(max_action_fix_retries + 1):
+            try:
+                if attempt == 0:
+                    actions_payload = get_phase_actions(phase_name, context, preferred_site=preferred_site)
+                else:
+                    actions_payload = get_corrected_phase_actions(
+                        phase_name,
+                        actions_payload or {"actions": []},
+                        last_validation_error,
+                        context,
+                        preferred_site=preferred_site,
+                    )
+                validate_actions(actions_payload)
+                _validate_phase_action_limits(actions_payload, phase_name)
+                _validate_action_consistency(actions_payload, context)
+                break
+            except ValidationError as exc:
+                last_validation_error = str(exc)
+                log_validation_failed(f"acciones:{phase_name}:intento_{attempt + 1}", last_validation_error)
+                if attempt >= max_action_fix_retries:
+                    log_action_blocked("phase_actions", last_validation_error)
+                    raise
+                log_phase_event(phase_name, "retry_actions_fix", f"attempt={attempt + 1} error={last_validation_error[:180]}")
 
         log_phase_event(phase_name, "start")
         actions = actions_payload.get("actions", [])
